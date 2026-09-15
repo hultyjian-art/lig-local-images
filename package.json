@@ -1,0 +1,7 @@
+{
+    "name": "lig-local-images",
+    "version": "1.0.0",
+    "description": "本地图片图床后端插件：任意目录只读图床 + user/images 嵌套管理",
+    "main": "index.mjs",
+    "type": "module"
+}
