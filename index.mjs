@@ -113,7 +113,7 @@ export async function init(router) {
 
   // ============ 探测 ============
   router.get('/ping', wrap(async (req, res) => {
-    res.json({ ok: true, name: info.name, version: '1.0.1', api: API_VERSION });
+    res.json({ ok: true, name: info.name, version: '1.0.2', api: API_VERSION });
   }));
 
   // ============ 只读图床：根管理 ============
@@ -133,17 +133,26 @@ export async function init(router) {
     const err = probeReadableDir(absPath);
     if (err) return res.status(400).json({ error: err });
     const roots = loadRoots(req.user.directories);
-    const existing = roots.find(r => path.resolve(r.path) === path.resolve(absPath));
-    if (existing) return res.json({ root: existing, imageCount: countImages(absPath) });
+    // 第47次: 归一化后入库+比对——白名单里可能存着历史带尾斜杠的脏 path,
+    // 命中复用时顺手回写归一化(自愈), 新注册也直接存归一化值, 从源头杜绝脏数据
+    const normalized = path.resolve(absPath);
+    const existing = roots.find(r => path.resolve(r.path) === normalized);
+    if (existing) {
+      if (existing.path !== normalized) {
+        existing.path = normalized;
+        saveRoots(req.user.directories, roots);
+      }
+      return res.json({ root: existing, imageCount: countImages(normalized) });
+    }
     const root = {
       id: newRootId(),
-      label: String(req.body?.label ?? '').trim() || path.basename(absPath),
-      path: absPath,
+      label: String(req.body?.label ?? '').trim() || path.basename(normalized),
+      path: normalized,
       addedAt: Date.now(),
     };
     roots.push(root);
     saveRoots(req.user.directories, roots);
-    res.json({ root, imageCount: countImages(absPath) });
+    res.json({ root, imageCount: countImages(normalized) });
   }));
 
   router.post('/roots/remove', wrap(async (req, res) => {
