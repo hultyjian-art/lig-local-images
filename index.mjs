@@ -54,13 +54,26 @@ function scanDir(abs, urlFor) {
   const entries = fs.readdirSync(abs, { withFileTypes: true });
   for (const ent of entries) {
     if (ent.name.startsWith('.')) continue;
-    if (ent.isDirectory()) {
+    // 第49次: Android /storage 的 FUSE 挂载不填 d_type, Dirent.isDirectory()/isFile()
+    // 双双返回 false, 图片既不进 dirs 也不进 images → 列表恒空。类型判定一律以
+    // statSync 为准 (FUSE 下可靠); Dirent 仅做快速路径。
+    const full = path.join(abs, ent.name);
+    let isDir = ent.isDirectory();
+    let isFile = ent.isFile();
+    if (!isDir && !isFile) {
+      try {
+        const st = fs.statSync(full);
+        isDir = st.isDirectory();
+        isFile = st.isFile();
+      } catch { continue; }
+    }
+    if (isDir) {
       dirs.push(ent.name);
-    } else if (ent.isFile() && isImage(ent.name)) {
+    } else if (isFile && isImage(ent.name)) {
       let size = 0;
       let mtime = 0;
       try {
-        const st = fs.statSync(path.join(abs, ent.name));
+        const st = fs.statSync(full);
         size = st.size;
         mtime = Math.floor(st.mtimeMs);
       } catch { /* 忽略单个文件的元数据失败 */ }
@@ -113,7 +126,7 @@ export async function init(router) {
 
   // ============ 探测 ============
   router.get('/ping', wrap(async (req, res) => {
-    res.json({ ok: true, name: info.name, version: '1.0.2', api: API_VERSION });
+    res.json({ ok: true, name: info.name, version: '1.0.3', api: API_VERSION });
   }));
 
   // ============ 只读图床：根管理 ============
@@ -287,7 +300,12 @@ export async function init(router) {
         let entries;
         try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { continue; }
         for (const ent of entries) {
-          if (!ent.isDirectory() || ent.name.startsWith('.')) continue;
+          // 第49次: FUSE 下 isDirectory() 可能恒 false, statSync 兜底
+          if (ent.name.startsWith('.')) continue;
+          if (!ent.isDirectory()) {
+            if (ent.isFile()) continue;
+            try { if (!fs.statSync(path.join(abs, ent.name)).isDirectory()) continue; } catch { continue; }
+          }
           scanned++;
           if (scanned >= ROOT_SCAN_LIMIT) { truncated = true; break; }
           const childRel = rel ? `${rel}/${ent.name}` : ent.name;
@@ -309,12 +327,24 @@ export async function init(router) {
 /** 统计目录（含子目录一层）内图片数量，用于注册反馈 */
 function countImages(absDir) {
   let count = 0;
+  // 第49次: 同 scanDir, 类型判定 statSync 兜底 (Android FUSE d_type 不可靠)
+  const isDirEnt = (ent, full) => {
+    if (ent.isDirectory()) return true;
+    if (ent.isFile()) return false;
+    try { return fs.statSync(full).isDirectory(); } catch { return false; }
+  };
+  const isFileEnt = (ent, full) => {
+    if (ent.isFile()) return true;
+    if (ent.isDirectory()) return false;
+    try { return fs.statSync(full).isFile(); } catch { return false; }
+  };
   try {
     for (const ent of fs.readdirSync(absDir, { withFileTypes: true })) {
-      if (ent.isFile() && isImage(ent.name)) count++;
-      else if (ent.isDirectory()) {
+      const full = path.join(absDir, ent.name);
+      if (isFileEnt(ent, full) && isImage(ent.name)) count++;
+      else if (isDirEnt(ent, full)) {
         try {
-          for (const sub of fs.readdirSync(path.join(absDir, ent.name))) {
+          for (const sub of fs.readdirSync(full)) {
             if (isImage(sub)) count++;
           }
         } catch { /* 子目录不可读则跳过 */ }
