@@ -47,11 +47,13 @@ function wrap(handler) {
   };
 }
 
-/** 单层扫描目录（懒加载友好） */
+/** 单层扫描目录（懒加载友好）；meta 供前端区分"真空目录"与"条目读不了" */
 function scanDir(abs, urlFor) {
   const dirs = [];
   const images = [];
   const entries = fs.readdirSync(abs, { withFileTypes: true });
+  let scanned = 0;
+  let skipped = 0;
   for (const ent of entries) {
     if (ent.name.startsWith('.')) continue;
     // 第49次: Android /storage 的 FUSE 挂载不填 d_type, Dirent.isDirectory()/isFile()
@@ -65,7 +67,12 @@ function scanDir(abs, urlFor) {
         const st = fs.statSync(full);
         isDir = st.isDirectory();
         isFile = st.isFile();
-      } catch { continue; }
+      } catch {
+        // 第50次: statSync 也失败(Android 分区存储权限的典型信号)→ 计数上报,
+        // 前端据此显示"条目读不了"而非误导性的"该目录为空"
+        skipped++;
+        continue;
+      }
     }
     if (isDir) {
       dirs.push(ent.name);
@@ -79,10 +86,11 @@ function scanDir(abs, urlFor) {
       } catch { /* 忽略单个文件的元数据失败 */ }
       images.push({ name: ent.name, size, mtime, url: urlFor(ent.name) });
     }
+    scanned++;
   }
   dirs.sort((a, b) => a.localeCompare(b, 'zh-CN', { numeric: true }));
   images.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
-  return { dirs, images };
+  return { dirs, images, meta: { scanned, skipped } };
 }
 
 /** 解析 root 参数 → { baseAbs, id }；library 指向 user/images */
@@ -126,7 +134,7 @@ export async function init(router) {
 
   // ============ 探测 ============
   router.get('/ping', wrap(async (req, res) => {
-    res.json({ ok: true, name: info.name, version: '1.0.3', api: API_VERSION });
+    res.json({ ok: true, name: info.name, version: '1.0.4', api: API_VERSION });
   }));
 
   // ============ 只读图床：根管理 ============
@@ -187,8 +195,8 @@ export async function init(router) {
     if (!r.ok) return res.status(r.code).json({ error: r.error });
     const err = probeReadableDir(r.abs);
     if (err) return res.status(404).json({ error: err });
-    const { dirs, images } = scanDir(r.abs, name => serveUrl(rootRef.id, dirRel, name));
-    res.json({ dirs, images });
+    const { dirs, images, meta } = scanDir(r.abs, name => serveUrl(rootRef.id, dirRel, name));
+    res.json({ dirs, images, meta });
   }));
 
   router.get('/file', wrap(async (req, res) => {
