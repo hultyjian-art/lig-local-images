@@ -9,13 +9,17 @@
  * 安全模型：
  * - 读：只允许已注册根 + 内置 library 根；扩展名白名单；resolveUnder 防穿越。
  * - 写：只允许 user/images 之下；cleanRel 去掉 .. 段；拒绝覆盖已存在的目标。
+ * - v1.0.5 破坏性操作再收紧：delete / rename / move 的目标必须至少两段，
+ *   即必须位于 user/images 的**某个子目录内**。该目录根层由酒馆自身使用
+ *   （实测有数十个以角色卡名命名的目录），绝不允许本插件直接操作。
+ *   前端 services/galleryScope.ts 有同规则的第一层防线（双保险）。
  * - 每用户隔离：白名单存在该用户 data 目录下。
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { cleanRel, isImage, probeReadableDir, resolveUnder } from './lib/guard.mjs';
+import { cleanRel, isImage, probeReadableDir, requireBelowImagesRoot, resolveUnder } from './lib/guard.mjs';
 import { loadRoots, newRootId, saveRoots } from './lib/store.mjs';
 
 export const info = {
@@ -134,7 +138,7 @@ export async function init(router) {
 
   // ============ 探测 ============
   router.get('/ping', wrap(async (req, res) => {
-    res.json({ ok: true, name: info.name, version: '1.0.4', api: API_VERSION });
+    res.json({ ok: true, name: info.name, version: '1.0.5', api: API_VERSION });
   }));
 
   // ============ 只读图床：根管理 ============
@@ -238,6 +242,11 @@ export async function init(router) {
     if (!from.ok) return res.status(from.code).json({ error: from.error });
     const to = resolveWritePath(req, String(req.body?.to ?? ''));
     if (!to.ok) return res.status(to.code).json({ error: to.error });
+    // v1.0.5: 破坏性操作不得作用于 user/images 根层（保护酒馆自身数据）
+    for (const p of [from, to]) {
+      const depth = requireBelowImagesRoot(p.cleaned);
+      if (!depth.ok) return res.status(depth.code).json({ error: depth.error });
+    }
     if (!fs.existsSync(from.abs)) return res.status(404).json({ error: '源不存在' });
     if (fs.existsSync(to.abs)) return res.status(409).json({ error: '目标已存在' });
     fs.mkdirSync(path.dirname(to.abs), { recursive: true });
@@ -248,6 +257,9 @@ export async function init(router) {
   router.post('/delete', wrap(async (req, res) => {
     const p = resolveWritePath(req, String(req.body?.path ?? ''));
     if (!p.ok) return res.status(p.code).json({ error: p.error });
+    // v1.0.5: 破坏性操作不得作用于 user/images 根层（保护酒馆自身数据）
+    const depth = requireBelowImagesRoot(p.cleaned);
+    if (!depth.ok) return res.status(depth.code).json({ error: depth.error });
     if (!fs.existsSync(p.abs)) return res.status(404).json({ error: '目标不存在' });
     removeRecursive(p.abs);
     res.json({ ok: true, path: p.cleaned });
@@ -259,6 +271,11 @@ export async function init(router) {
     if (!from.ok) return res.status(from.code).json({ error: from.error });
     const to = resolveWritePath(req, String(req.body?.to ?? ''));
     if (!to.ok) return res.status(to.code).json({ error: to.error });
+    // v1.0.5: 破坏性操作不得作用于 user/images 根层（保护酒馆自身数据）
+    for (const p of [from, to]) {
+      const depth = requireBelowImagesRoot(p.cleaned);
+      if (!depth.ok) return res.status(depth.code).json({ error: depth.error });
+    }
     if (!fs.existsSync(from.abs)) return res.status(404).json({ error: '源不存在' });
     if (fs.existsSync(to.abs)) return res.status(409).json({ error: '目标已存在' });
     if (to.abs.startsWith(from.abs + path.sep)) return res.status(400).json({ error: '不能移动到自身内部' });
