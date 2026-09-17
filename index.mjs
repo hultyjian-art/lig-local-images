@@ -34,7 +34,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.0.6';
+const PLUGIN_VERSION = '1.0.7';
 
 /** 取当前用户的 user/images 绝对路径 (Luker 的 DATA_ROOT 可能是相对路径, 必须 resolve) */
 function userImages(req) {
@@ -356,11 +356,38 @@ export async function init(router) {
 
   /** jimp 句柄：null=未探测，false=不可用 */
   let jimpHandle = null;
+
+  /**
+   * v1.0.7: 放宽 jpeg-js 解码器的内存上限。
+   * jimp 0.x 的 jpeg 解码器 = jpeg-js.decode 裸函数（不传 opts），其默认
+   * maxMemoryUsageInMB=512MB；大图（如 8000×8000 级别的扫图/照片）解码足迹可达
+   * 700MB+，于是 /thumb 全部报 "maxMemoryUsageInMB limit exceeded" 回退原图。
+   * 这里用带大上限的 wrapper 覆盖 Jimp.decoders['image/jpeg']（jimp 0.22 的
+   * 静态可变 map，运行时查找，覆盖即生效）。覆盖失败只告警，不影响其余流程。
+   */
+  async function raiseJpegMemoryLimit(Jimp) {
+    try {
+      if (!Jimp || typeof Jimp !== 'function' || !Jimp.decoders) return;
+      const mod = await import('jpeg-js');
+      const jpegJs = mod.default || mod;
+      if (typeof jpegJs?.decode !== 'function') return;
+      const current = Jimp.decoders['image/jpeg'];
+      // 已经是带 opts 的 wrapper（重复加载）就不再包一层
+      if (current && current.__ligPatched) return;
+      const patched = (data) => jpegJs.decode(data, { maxMemoryUsageInMB: 4096 });
+      patched.__ligPatched = true;
+      Jimp.decoders['image/jpeg'] = patched;
+    } catch (e) {
+      console.warn('[lig-local-images] 放宽 jpeg 内存上限失败（保持默认 512MB）:', fmtErr(e));
+    }
+  }
+
   async function loadJimp() {
     if (jimpHandle !== null) return jimpHandle;
     try {
       const m = await import('jimp');
       jimpHandle = m.Jimp || m.default || m;
+      await raiseJpegMemoryLimit(jimpHandle);
     } catch (e) {
       console.warn('[lig-local-images] jimp 不可用，缩略图将回退原图:', fmtErr(e));
       jimpHandle = false;
