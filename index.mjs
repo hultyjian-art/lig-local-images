@@ -14,6 +14,9 @@
  *   （实测有数十个以角色卡名命名的目录），绝不允许本插件直接操作。
  *   前端 services/galleryScope.ts 有同规则的第一层防线（双保险）。
  * - 每用户隔离：白名单存在该用户 data 目录下。
+ * - v1.0.6 新增只读 /diag：把 user/images 与各注册根的路径归属、exists/stat/access/readdir
+ *   各层结果、逐条 stat 样本全列出来，用于现场判定"目录有内容却显示为空"到底是
+ *   路径错、权限被静默过滤、还是真的空。无副作用，不写盘。
  */
 
 import fs from 'node:fs';
@@ -30,6 +33,8 @@ export const info = {
 
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
+/** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
+const PLUGIN_VERSION = '1.0.6';
 
 /** 取当前用户的 user/images 绝对路径 (Luker 的 DATA_ROOT 可能是相对路径, 必须 resolve) */
 function userImages(req) {
@@ -52,7 +57,7 @@ function wrap(handler) {
 }
 
 /** 单层扫描目录（懒加载友好）；meta 供前端区分"真空目录"与"条目读不了" */
-function scanDir(abs, urlFor) {
+function scanDir(abs, urlFor, thumbFor) {
   const dirs = [];
   const images = [];
   const entries = fs.readdirSync(abs, { withFileTypes: true });
@@ -88,13 +93,99 @@ function scanDir(abs, urlFor) {
         size = st.size;
         mtime = Math.floor(st.mtimeMs);
       } catch { /* 忽略单个文件的元数据失败 */ }
-      images.push({ name: ent.name, size, mtime, url: urlFor(ent.name) });
+      images.push({ name: ent.name, size, mtime, url: urlFor(ent.name), thumb: thumbFor ? thumbFor(ent.name) : undefined });
     }
     scanned++;
   }
   dirs.sort((a, b) => a.localeCompare(b, 'zh-CN', { numeric: true }));
   images.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
   return { dirs, images, meta: { scanned, skipped } };
+}
+
+/** 错误短格式（带 errno code，便于一眼看出 EACCES / ENOENT） */
+function fmtErr(e) {
+  if (!e) return String(e);
+  return e.code ? `${e.code}: ${e.message}` : String(e.message ?? e);
+}
+
+/**
+ * 判断一个绝对路径处在哪种存储区，据此推断 Node 进程能否直接读。
+ * 这是"目录有内容却显示为空"最决定性的线索：Android 分区存储下，
+ * App 对无权限的目录 readdir 往往【静默返回空数组】而不是报 EACCES，
+ * 于是"真的空"与"被系统过滤"在结果上一模一样。
+ */
+function describeStorageScope(abs) {
+  if (!abs) return '未知（路径为空）';
+  if (/^\/data\/(user|data)\/\d+\//.test(abs)) return 'App 私有内部存储 · 不受分区存储限制，必然可读';
+  if (/\/Android\/data\/[^/]+\/files(\/|$)/.test(abs)) return 'App 专属外部存储 · 不受分区存储限制，必然可读';
+  if (/^\/storage\/emulated\/\d+\//.test(abs)) return '公共外部存储 · 受 Android 分区存储限制，App 无权直读（readdir 通常返回空而不报错）';
+  if (/^\/storage\//.test(abs)) return '外部挂载卷 · 受分区存储限制';
+  if (/^[A-Za-z]:[\\/]/.test(abs)) return 'Windows 盘符路径 · 无 Android 限制';
+  return '其它';
+}
+
+/** 把一个路径逐层探一遍（只读、无副作用；任何一步失败都记录而非抛出） */
+function auditDir(abs, opts = {}) {
+  const out = { abs: abs ?? null };
+  if (!abs) {
+    out.scope = describeStorageScope(null);
+    out.note = '路径为空 —— 上游（req.user.directories.userImages）没取到值';
+    return out;
+  }
+  out.scope = describeStorageScope(abs);
+  try {
+    out.exists = fs.existsSync(abs);
+  } catch (e) {
+    out.existsErr = fmtErr(e);
+  }
+  if (!out.exists) {
+    out.note = '路径不存在';
+    return out;
+  }
+  try {
+    out.isDirectory = fs.statSync(abs).isDirectory();
+  } catch (e) {
+    out.statErr = fmtErr(e);
+  }
+  try {
+    fs.accessSync(abs, fs.constants.R_OK | fs.constants.X_OK);
+    out.access = 'ok';
+  } catch (e) {
+    out.access = 'denied';
+    out.accessErr = fmtErr(e);
+  }
+  try {
+    const raw = fs.readdirSync(abs);
+    out.readdirCount = raw.length;
+    out.readdirSample = raw.slice(0, opts.sampleLimit ?? 15);
+    const limit = Math.min(raw.length, 20);
+    let statOk = 0;
+    let statFail = 0;
+    let dirs = 0;
+    let files = 0;
+    let firstFail = null;
+    for (let i = 0; i < limit; i++) {
+      try {
+        const st = fs.statSync(path.join(abs, raw[i]));
+        statOk++;
+        if (st.isDirectory()) dirs++;
+        else files++;
+      } catch (e) {
+        statFail++;
+        if (!firstFail) firstFail = `${raw[i]} → ${fmtErr(e)}`;
+      }
+    }
+    out.statProbe = { tried: limit, statOk, statFail, dirs, files, firstFail };
+    if (!raw.length) {
+      out.note = /分区存储/.test(out.scope)
+        ? 'readdir 返回 0 条。上方 scope 是"公共外部存储"→ 这是被分区存储【静默过滤】的典型表现（不报错、直接空），不是目录真的空。'
+        : 'readdir 返回 0 条，且路径不在受限存储区 → 目录确实为空，或酒馆尚未在这个用户下写入过图片。';
+    }
+  } catch (e) {
+    out.readdirErr = fmtErr(e);
+    out.note = 'readdir 抛错 → 属于权限/路径问题，错误码见 readdirErr';
+  }
+  return out;
 }
 
 /** 解析 root 参数 → { baseAbs, id }；library 指向 user/images */
@@ -138,7 +229,7 @@ export async function init(router) {
 
   // ============ 探测 ============
   router.get('/ping', wrap(async (req, res) => {
-    res.json({ ok: true, name: info.name, version: '1.0.5', api: API_VERSION });
+    res.json({ ok: true, name: info.name, version: PLUGIN_VERSION, api: API_VERSION });
   }));
 
   // ============ 只读图床：根管理 ============
@@ -180,6 +271,41 @@ export async function init(router) {
     res.json({ root, imageCount: countImages(normalized) });
   }));
 
+  // ============ 诊断（只读、无副作用） ============
+  /**
+   * v1.0.6: 现场诊断"目录里明明有内容，图库却显示为空"。
+   * 输出路径归属（私有/专属外部/公共外部）、exists/stat/access/readdir 各层结果、
+   * 前若干条的逐条 stat，并以 userImages 的父目录（user/）作对照：
+   * 若 user/ 能列出 characters/chats/images 等，说明进程对数据区有读权限，
+   * 那 images 的"空"就是它自身的问题；若连 user/ 也读不出，则是整体权限或路径错。
+   */
+  router.get('/diag', wrap(async (req, res) => {
+    const images = userImages(req);
+    res.json({
+      ok: true,
+      version: PLUGIN_VERSION,
+      api: API_VERSION,
+      runtime: {
+        platform: process.platform,
+        arch: process.arch,
+        node: process.version,
+        cwd: process.cwd(),
+        pid: process.pid,
+      },
+      user: {
+        name: req.user?.name ?? null,
+        directories: req.user?.directories ?? null,
+      },
+      library: auditDir(images, { sampleLimit: 20 }),
+      userDir: auditDir(images ? path.dirname(images) : null, { sampleLimit: 30 }),
+      registeredRoots: loadRoots(req.user.directories).map(r => ({
+        id: r.id,
+        label: r.label,
+        ...auditDir(r.path, { sampleLimit: 10 }),
+      })),
+    });
+  }));
+
   router.post('/roots/remove', wrap(async (req, res) => {
     const id = String(req.body?.id ?? '');
     if (!id || id === LIBRARY_ROOT_ID) return res.status(400).json({ error: '内置图库根不可移除' });
@@ -199,7 +325,11 @@ export async function init(router) {
     if (!r.ok) return res.status(r.code).json({ error: r.error });
     const err = probeReadableDir(r.abs);
     if (err) return res.status(404).json({ error: err });
-    const { dirs, images, meta } = scanDir(r.abs, name => serveUrl(rootRef.id, dirRel, name));
+    const { dirs, images, meta } = scanDir(
+      r.abs,
+      name => serveUrl(rootRef.id, dirRel, name),
+      name => serveThumbUrl(rootRef.id, dirRel, name),
+    );
     res.json({ dirs, images, meta });
   }));
 
@@ -211,6 +341,99 @@ export async function init(router) {
     if (!isImage(r.abs)) return res.status(403).json({ error: '仅允许图片文件' });
     if (!fs.existsSync(r.abs) || !fs.statSync(r.abs).isFile()) return res.status(404).json({ error: '文件不存在' });
     res.sendFile(r.abs);
+  }));
+
+  // ============ 缩略图（v1.0.6） ============
+  // 图库原先直出原图：实测一张 2134×3200 的 jpg 有 773KB，一页 50 张就近 40MB。
+  // 这里按需缩放成小图（宽 240 约 25KB，降幅 96.8%），并做内存 LRU 缓存。
+  // 关键：jimp 只是「尽力而为」——加载或缩放失败一律 302 回退到原图，
+  // 保证图片始终能显示（不会因为缺依赖把功能弄坏）。
+  const THUMB_WIDTH = { min: 64, max: 640, def: 320 };
+
+  /** 缩略图内存缓存（Map 按插入序，超上限逐出最早的） */
+  const thumbCache = new Map();
+  const THUMB_CACHE_MAX = 300;
+
+  /** jimp 句柄：null=未探测，false=不可用 */
+  let jimpHandle = null;
+  async function loadJimp() {
+    if (jimpHandle !== null) return jimpHandle;
+    try {
+      const m = await import('jimp');
+      jimpHandle = m.Jimp || m.default || m;
+    } catch (e) {
+      console.warn('[lig-local-images] jimp 不可用，缩略图将回退原图:', fmtErr(e));
+      jimpHandle = false;
+    }
+    return jimpHandle;
+  }
+
+  /** 把 CPU 密集的缩放串行化，避免多个请求同时解码把进程拖死 */
+  let thumbChain = Promise.resolve();
+  function withThumbLock(fn) {
+    const next = thumbChain.then(fn, fn);
+    thumbChain = next.then(() => {}, () => {});
+    return next;
+  }
+
+  /** 原图 URL（回退用）：直接复用 serveUrl，避免两处格式不一致 */
+  function fileUrlFor(rootId, relPath) {
+    const segs = String(relPath).split('/').filter(Boolean);
+    const name = segs.pop() ?? '';
+    return serveUrl(rootId, segs.join('/'), name);
+  }
+
+  router.get('/thumb', wrap(async (req, res) => {
+    const rootRef = resolveRootBase(req, String(req.query?.root ?? ''));
+    if (!rootRef) return res.status(404).json({ error: '根不存在' });
+    const relPath = String(req.query?.path ?? '');
+    const fallback = fileUrlFor(rootRef.id, relPath);
+    const r = resolveUnder(rootRef.baseAbs, relPath);
+    if (!r.ok) return res.redirect(302, fallback);
+    if (!isImage(r.abs)) return res.redirect(302, fallback);
+    try {
+      if (!fs.existsSync(r.abs) || !fs.statSync(r.abs).isFile()) return res.redirect(302, fallback);
+    } catch {
+      return res.redirect(302, fallback);
+    }
+
+    const asked = Number(req.query?.w ?? THUMB_WIDTH.def);
+    const width = Number.isFinite(asked)
+      ? Math.min(THUMB_WIDTH.max, Math.max(THUMB_WIDTH.min, Math.round(asked)))
+      : THUMB_WIDTH.def;
+
+    const cacheKey = `${r.abs}|${width}`;
+    const hit = thumbCache.get(cacheKey);
+    if (hit) {
+      res.type('image/jpeg').set('Cache-Control', 'public, max-age=86400').send(hit);
+      return;
+    }
+
+    const jimp = await loadJimp();
+    if (!jimp) return res.redirect(302, fallback);
+
+    try {
+      const buf = await withThumbLock(async () => {
+        const img = await jimp.read(r.abs);
+        const w0 = img.bitmap?.width ?? 0;
+        const h0 = img.bitmap?.height ?? 0;
+        if (!w0 || !h0) throw new Error('无法解码图片尺寸');
+        // 已经比目标还小就不放大，直接回退原图（避免糊）
+        if (w0 <= width) return null;
+        img.resize(width, Math.max(1, Math.round((h0 * width) / w0)));
+        img.quality(72);
+        return img.getBufferAsync(jimp.MIME_JPEG);
+      });
+      if (!buf) return res.redirect(302, fallback);
+      if (thumbCache.size >= THUMB_CACHE_MAX) {
+        thumbCache.delete(thumbCache.keys().next().value);
+      }
+      thumbCache.set(cacheKey, buf);
+      res.type('image/jpeg').set('Cache-Control', 'public, max-age=86400').send(buf);
+    } catch (e) {
+      console.warn('[lig-local-images] 生成缩略图失败，回退原图:', fmtErr(e));
+      res.redirect(302, fallback);
+    }
   }));
 
   // ============ user/images 嵌套管理 ============
@@ -390,6 +613,16 @@ function serveUrl(rootId, dirRel, name) {
     return `/user/images/${rel.split('/').map(encodeURIComponent).join('/')}`;
   }
   return `/api/plugins/${info.id}/file?root=${encodeURIComponent(rootId)}&path=${encodeURIComponent(rel)}`;
+}
+
+/**
+ * 缩略图 URL（v1.0.6）。
+ * 一律走插件自己的 /thumb —— 内置 library 根不能用 serveUrl 的 /user/images 直接缩放，
+ * 而 /thumb 两端都能统一处理。宽度固定传 320：网格单元约 96~140px，2x 屏也够清晰。
+ */
+function serveThumbUrl(rootId, dirRel, name, width = 320) {
+  const rel = dirRel ? `${dirRel}/${name}` : name;
+  return `/api/plugins/${info.id}/thumb?root=${encodeURIComponent(rootId)}&path=${encodeURIComponent(rel)}&w=${width}`;
 }
 
 export async function exit() {
