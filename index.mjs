@@ -15,6 +15,9 @@
  *   前端 services/galleryScope.ts 有同规则的第一层防线（双保险）。
  * - 每用户隔离：白名单存在该用户 data 目录下。
  * - v1.0.7 放宽 jpeg-js 解码内存上限（512MB → 4096MB），修复大图缩略图全部回退原图。
+ * - v1.1.1 回退原图也带原因 + 文件名（redirectReasons / recent），用于定位
+ *   "缩略图为什么没生成"：badPath / notImage / missing / tooSmall（原图本就更小，
+ *   属正常）/ queueFull（队列积压）/ decodeFailed / noJimp。
  * - v1.1.0 新增缩略图格式统计：/ping 返回 thumb:{webp,jpeg,redirectedToOriginal,errors,recent}，
  *   /ping?reset=1 可清零，/diag 同样带 —— 用于确认 WebP 是否真的生效（长按保存图片拿到的是
  *   原图，不能用来判断缩略图格式）。未改动缩略图管道本身，故 THUMB_URL_VERSION 不变。
@@ -48,7 +51,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.1.0';
+const PLUGIN_VERSION = '1.1.1';
 
 /**
  * 缩略图 URL 的版本号（第62次新增，跟随 WebP 协商一起发布）。
@@ -395,13 +398,39 @@ export async function init(router) {
    * 自查流程：先访问 /ping?reset=1 清零 → 在图库浏览几页 → 再访问 /ping 看
    * thumb.webp / thumb.jpeg 的计数；webp>0 且 jpeg=0 即为完全生效。
    */
-  const thumbStats = { webp: 0, jpeg: 0, redirected: 0, errors: 0, last: [] };
+  const thumbStats = { webp: 0, jpeg: 0, redirected: 0, errors: 0, last: [], reasons: {} };
 
-  function noteThumb(mime, width) {
+  function pushRecent(text) {
+    thumbStats.last.push(text);
+    if (thumbStats.last.length > 12) thumbStats.last.shift();
+  }
+
+  function noteThumb(mime, width, name) {
     if (mime === 'image/webp') thumbStats.webp++;
     else thumbStats.jpeg++;
-    thumbStats.last.push(`${mime === 'image/webp' ? 'webp' : 'jpeg'}@${width}`);
-    if (thumbStats.last.length > 12) thumbStats.last.shift();
+    pushRecent(`${shortName(name)}→${mime === 'image/webp' ? 'webp' : 'jpeg'}@${width}`);
+  }
+
+  /**
+   * 记录一次"回退原图"并带上原因 —— 这是排查"缩略图为什么没生成"的关键。
+   * 原因取值：
+   *   badPath        路径非法/越界
+   *   notImage       扩展名不是图片
+   *   missing        文件不存在或不是文件
+   *   tooSmall       原图宽度 ≤ 请求宽度（本就不需要缩略图，属正常）
+   *   queueFull      等待队列积压（超过 THUMB_QUEUE_MAX，主动放弃以免拖死）
+   *   decodeFailed   解码/编码抛错（jimp 不可用、大图内存、文件损坏…）
+   *   noJimp         jimp 加载失败
+   */
+  function noteRedirect(reason, name) {
+    thumbStats.redirected++;
+    thumbStats.reasons[reason] = (thumbStats.reasons[reason] || 0) + 1;
+    pushRecent(`${shortName(name)}→${reason}`);
+  }
+
+  function shortName(n) {
+    const b = String(n || '?');
+    return b.length > 22 ? '…' + b.slice(-21) : b;
   }
 
   function thumbStatsSnapshot() {
@@ -409,6 +438,7 @@ export async function init(router) {
       webp: thumbStats.webp,
       jpeg: thumbStats.jpeg,
       redirectedToOriginal: thumbStats.redirected,
+      redirectReasons: { ...thumbStats.reasons },
       errors: thumbStats.errors,
       recent: thumbStats.last.slice(),
     };
@@ -420,6 +450,7 @@ export async function init(router) {
     thumbStats.redirected = 0;
     thumbStats.errors = 0;
     thumbStats.last.length = 0;
+    thumbStats.reasons = {};
   }
 
   /**
@@ -451,7 +482,9 @@ export async function init(router) {
         workerBusy = false;
         if (task) {
           pendingTasks.delete(msg.id);
-          if (msg.ok) task.resolve(msg.buf ? { buf: Buffer.from(msg.buf), mime: msg.mime || 'image/jpeg' } : null);
+          if (msg.ok) {
+            task.resolve(msg.buf ? { buf: Buffer.from(msg.buf), mime: msg.mime || 'image/jpeg' } : { reason: msg.reason || 'tooSmall' });
+          }
           else task.reject(new Error(msg.error || 'worker 解码失败'));
         }
         drainThumbQueue();
@@ -490,12 +523,13 @@ export async function init(router) {
   /** 主线程回退路径（worker 不可用时）：串行解码，队列超限同样直接放弃 */
   let mainChain = Promise.resolve();
   async function decodeThumbOnMainThread(abs, width, format) {
-    if (fallbackQueue >= THUMB_QUEUE_MAX) return null;
+    if (fallbackQueue >= THUMB_QUEUE_MAX) return { reason: 'queueFull' };
     fallbackQueue++;
     const run = mainChain.then(() => decodeThumb(abs, width, undefined, format), () => decodeThumb(abs, width, undefined, format));
     mainChain = run.then(() => {}, () => {});
     try {
-      return await run;
+      const r = await run;
+      return r || { reason: 'tooSmall' };
     } finally {
       fallbackQueue--;
     }
@@ -512,17 +546,17 @@ export async function init(router) {
         return await decodeThumbOnMainThread(abs, width, format);
       } catch (e) {
         console.warn('[lig-local-images] 主线程生成缩略图失败，回退原图:', fmtErr(e));
-        return null;
+        return { reason: 'decodeFailed' };
       }
     }
-    if (taskQueue.length + (workerBusy ? 1 : 0) >= THUMB_QUEUE_MAX) return null;
+    if (taskQueue.length + (workerBusy ? 1 : 0) >= THUMB_QUEUE_MAX) return { reason: 'queueFull' };
     return new Promise((resolve) => {
       const id = ++taskSeq;
       pendingTasks.set(id, {
         resolve: (out) => resolve(out),
         reject: (e) => {
           console.warn('[lig-local-images] 生成缩略图失败，回退原图:', fmtErr(e));
-          resolve(null);
+          resolve({ reason: 'decodeFailed' });
         },
       });
       taskQueue.push({ id, abs, width, format });
@@ -543,11 +577,21 @@ export async function init(router) {
     const relPath = String(req.query?.path ?? '');
     const fallback = fileUrlFor(rootRef.id, relPath);
     const r = resolveUnder(rootRef.baseAbs, relPath);
-    if (!r.ok) return res.redirect(302, fallback);
-    if (!isImage(r.abs)) return res.redirect(302, fallback);
+    if (!r.ok) {
+      noteRedirect('badPath', relPath);
+      return res.redirect(302, fallback);
+    }
+    if (!isImage(r.abs)) {
+      noteRedirect('notImage', relPath);
+      return res.redirect(302, fallback);
+    }
     try {
-      if (!fs.existsSync(r.abs) || !fs.statSync(r.abs).isFile()) return res.redirect(302, fallback);
+      if (!fs.existsSync(r.abs) || !fs.statSync(r.abs).isFile()) {
+        noteRedirect('missing', relPath);
+        return res.redirect(302, fallback);
+      }
     } catch {
+      noteRedirect('missing', relPath);
       return res.redirect(302, fallback);
     }
 
@@ -572,25 +616,28 @@ export async function init(router) {
     }
 
     // jimp 不可用则直接回退原图（不阻塞、不报错）
-    if (!(await loadJimp())) return res.redirect(302, fallback);
+    if (!(await loadJimp())) {
+      noteRedirect('noJimp', relPath);
+      return res.redirect(302, fallback);
+    }
 
     try {
       const out = await generateThumb(r.abs, width, format);
-      if (!out) {
-        // 原图已够小 / 队列积压 / 解码失败 —— 都会回退原图
-        thumbStats.redirected++;
+      if (!out.buf) {
+        noteRedirect(out.reason || 'unknown', relPath);
         return res.redirect(302, fallback);
       }
       if (thumbCache.size >= THUMB_CACHE_MAX) {
         thumbCache.delete(thumbCache.keys().next().value);
       }
       thumbCache.set(cacheKey, out);
-      noteThumb(out.mime, width);
+      noteThumb(out.mime, width, relPath);
       // ⚠️ Vary: Accept 必须带上 —— 否则中间缓存可能把 webp 响应喂给不支持 webp 的客户端。
       // 响应格式以 out.mime 为准（webp 编码失败时会退回 jpeg）。
       res.type(out.mime).set('Cache-Control', 'public, max-age=86400').set('Vary', 'Accept').send(out.buf);
     } catch (e) {
       thumbStats.errors++;
+      noteRedirect('decodeFailed', relPath);
       console.warn('[lig-local-images] 生成缩略图失败，回退原图:', fmtErr(e));
       res.redirect(302, fallback);
     }
