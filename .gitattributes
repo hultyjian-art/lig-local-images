@@ -1,0 +1,7 @@
+# 二进制文件禁止任何换行/编码转换（webp 编码器的 wasm 必须逐字节一致）
+*.wasm binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.woff2 binary
