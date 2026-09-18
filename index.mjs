@@ -15,6 +15,9 @@
  *   前端 services/galleryScope.ts 有同规则的第一层防线（双保险）。
  * - 每用户隔离：白名单存在该用户 data 目录下。
  * - v1.0.7 放宽 jpeg-js 解码内存上限（512MB → 4096MB），修复大图缩略图全部回退原图。
+ * - v1.1.0 新增缩略图格式统计：/ping 返回 thumb:{webp,jpeg,redirectedToOriginal,errors,recent}，
+ *   /ping?reset=1 可清零，/diag 同样带 —— 用于确认 WebP 是否真的生效（长按保存图片拿到的是
+ *   原图，不能用来判断缩略图格式）。未改动缩略图管道本身，故 THUMB_URL_VERSION 不变。
  * - v1.0.9 /thumb 支持 WebP 输出：按请求 Accept 协商（浏览器 <img> 自动带 image/webp），
  *   体积比 JPEG 小 39~46%、编码耗时持平（实测 49KB→30KB / 40ms→38ms）。编码器为
  *   vendored libwebp wasm（lib/webp/，281KB），本地 readFileSync + 手动实例化，
@@ -45,7 +48,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.0.9';
+const PLUGIN_VERSION = '1.1.0';
 
 /**
  * 缩略图 URL 的版本号（第62次新增，跟随 WebP 协商一起发布）。
@@ -253,7 +256,9 @@ export async function init(router) {
 
   // ============ 探测 ============
   router.get('/ping', wrap(async (req, res) => {
-    res.json({ ok: true, name: info.name, version: PLUGIN_VERSION, api: API_VERSION });
+    // ?reset=1 清零缩略图统计 —— 方便"清缓存 → 浏览图库 → 再看计数"的自查流程
+    if (/^(1|true|yes|on)$/i.test(String(req.query?.reset ?? ''))) resetThumbStats();
+    res.json({ ok: true, name: info.name, version: PLUGIN_VERSION, api: API_VERSION, thumb: thumbStatsSnapshot() });
   }));
 
   // ============ 只读图床：根管理 ============
@@ -306,6 +311,7 @@ export async function init(router) {
   router.get('/diag', wrap(async (req, res) => {
     const images = userImages(req);
     res.json({
+      thumb: thumbStatsSnapshot(),
       ok: true,
       version: PLUGIN_VERSION,
       api: API_VERSION,
@@ -377,6 +383,44 @@ export async function init(router) {
   /** 缩略图内存缓存（Map 按插入序，超上限逐出最早的） */
   const thumbCache = new Map();
   const THUMB_CACHE_MAX = 300;
+
+  /**
+   * 缩略图格式统计（第63次新增，v1.1.0）。
+   *
+   * 解决什么问题：WebP 是按请求 Accept 协商输出的，用户在图库上"看起来一样"，
+   * 无法判断 webp 到底有没有生效；而"长按保存图片"拿到的一般是原图（插入/下载走
+   * httpUrl 原图，只有网格 <img src> 才指向 /thumb），更容易误判。
+   * 这里把**实际编码结果**累计下来，通过 /ping 与 /diag 暴露出去。
+   *
+   * 自查流程：先访问 /ping?reset=1 清零 → 在图库浏览几页 → 再访问 /ping 看
+   * thumb.webp / thumb.jpeg 的计数；webp>0 且 jpeg=0 即为完全生效。
+   */
+  const thumbStats = { webp: 0, jpeg: 0, redirected: 0, errors: 0, last: [] };
+
+  function noteThumb(mime, width) {
+    if (mime === 'image/webp') thumbStats.webp++;
+    else thumbStats.jpeg++;
+    thumbStats.last.push(`${mime === 'image/webp' ? 'webp' : 'jpeg'}@${width}`);
+    if (thumbStats.last.length > 12) thumbStats.last.shift();
+  }
+
+  function thumbStatsSnapshot() {
+    return {
+      webp: thumbStats.webp,
+      jpeg: thumbStats.jpeg,
+      redirectedToOriginal: thumbStats.redirected,
+      errors: thumbStats.errors,
+      recent: thumbStats.last.slice(),
+    };
+  }
+
+  function resetThumbStats() {
+    thumbStats.webp = 0;
+    thumbStats.jpeg = 0;
+    thumbStats.redirected = 0;
+    thumbStats.errors = 0;
+    thumbStats.last.length = 0;
+  }
 
   /**
    * ===== 第60次：缩略图解码移入 worker 线程 =====
@@ -532,15 +576,21 @@ export async function init(router) {
 
     try {
       const out = await generateThumb(r.abs, width, format);
-      if (!out) return res.redirect(302, fallback);
+      if (!out) {
+        // 原图已够小 / 队列积压 / 解码失败 —— 都会回退原图
+        thumbStats.redirected++;
+        return res.redirect(302, fallback);
+      }
       if (thumbCache.size >= THUMB_CACHE_MAX) {
         thumbCache.delete(thumbCache.keys().next().value);
       }
       thumbCache.set(cacheKey, out);
+      noteThumb(out.mime, width);
       // ⚠️ Vary: Accept 必须带上 —— 否则中间缓存可能把 webp 响应喂给不支持 webp 的客户端。
       // 响应格式以 out.mime 为准（webp 编码失败时会退回 jpeg）。
       res.type(out.mime).set('Cache-Control', 'public, max-age=86400').set('Vary', 'Accept').send(out.buf);
     } catch (e) {
+      thumbStats.errors++;
       console.warn('[lig-local-images] 生成缩略图失败，回退原图:', fmtErr(e));
       res.redirect(302, fallback);
     }
