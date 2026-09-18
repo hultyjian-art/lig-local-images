@@ -47,6 +47,19 @@ const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
 const PLUGIN_VERSION = '1.0.9';
 
+/**
+ * 缩略图 URL 的版本号（第62次新增，跟随 WebP 协商一起发布）。
+ *
+ * 为什么需要它：/thumb 的响应带 `Cache-Control: public, max-age=86400`，浏览器会
+ * 把旧响应缓存一整天。新增 WebP 协商后，同一个 URL 的新旧响应内容不同
+ * （旧=jpeg、新=webp），而**旧缓存条目没有 Vary 头**，浏览器仍会按 URL 命中它 ——
+ * 表现就是"重启后 webp 好像没生效"。
+ * 递增此版本号即生成全新 URL，直接绕过所有旧缓存条目。
+ *
+ * ⚠️ 只在"缩略图管道语义变了、必须让客户端重新拉取"时递增，别当成普通构建号用。
+ */
+const THUMB_URL_VERSION = 2;
+
 /** 取当前用户的 user/images 绝对路径 (Luker 的 DATA_ROOT 可能是相对路径, 必须 resolve) */
 function userImages(req) {
   const p = req.user?.directories?.userImages ?? null;
@@ -719,7 +732,7 @@ function serveUrl(rootId, dirRel, name) {
  */
 function serveThumbUrl(rootId, dirRel, name, width = 320) {
   const rel = dirRel ? `${dirRel}/${name}` : name;
-  return `/api/plugins/${info.id}/thumb?root=${encodeURIComponent(rootId)}&path=${encodeURIComponent(rel)}&w=${width}`;
+  return `/api/plugins/${info.id}/thumb?root=${encodeURIComponent(rootId)}&path=${encodeURIComponent(rel)}&w=${width}&v=${THUMB_URL_VERSION}`;
 }
 
 export async function exit() {
