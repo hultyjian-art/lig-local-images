@@ -15,6 +15,11 @@
  *   前端 services/galleryScope.ts 有同规则的第一层防线（双保险）。
  * - 每用户隔离：白名单存在该用户 data 目录下。
  * - v1.0.7 放宽 jpeg-js 解码内存上限（512MB → 4096MB），修复大图缩略图全部回退原图。
+ * - v1.0.9 /thumb 支持 WebP 输出：按请求 Accept 协商（浏览器 <img> 自动带 image/webp），
+ *   体积比 JPEG 小 39~46%、编码耗时持平（实测 49KB→30KB / 40ms→38ms）。编码器为
+ *   vendored libwebp wasm（lib/webp/，281KB），本地 readFileSync + 手动实例化，
+ *   零网络依赖，Luker 与原版 ST 行为一致；编码失败自动退回 JPEG。缓存键含格式，
+ *   响应带 Vary: Accept。?webp=0 可强制 JPEG。
  * - v1.0.8 缩略图解码移入 worker 线程 + 队列上限 32：jimp 的同步解码会占满事件循环
  *   （实测单张 2.1 秒），导致 /roots /tree 被阻塞、前端 30 秒超时（signal is aborted
  *   without reason）。现在主线程不再被解码阻塞；队列积压时直接回退原图。
@@ -40,7 +45,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.0.8';
+const PLUGIN_VERSION = '1.0.9';
 
 /** 取当前用户的 user/images 绝对路径 (Luker 的 DATA_ROOT 可能是相对路径, 必须 resolve) */
 function userImages(req) {
@@ -389,7 +394,7 @@ export async function init(router) {
         workerBusy = false;
         if (task) {
           pendingTasks.delete(msg.id);
-          if (msg.ok) task.resolve(msg.buf ? Buffer.from(msg.buf) : null);
+          if (msg.ok) task.resolve(msg.buf ? { buf: Buffer.from(msg.buf), mime: msg.mime || 'image/jpeg' } : null);
           else task.reject(new Error(msg.error || 'worker 解码失败'));
         }
         drainThumbQueue();
@@ -427,10 +432,10 @@ export async function init(router) {
 
   /** 主线程回退路径（worker 不可用时）：串行解码，队列超限同样直接放弃 */
   let mainChain = Promise.resolve();
-  async function decodeThumbOnMainThread(abs, width) {
+  async function decodeThumbOnMainThread(abs, width, format) {
     if (fallbackQueue >= THUMB_QUEUE_MAX) return null;
     fallbackQueue++;
-    const run = mainChain.then(() => decodeThumb(abs, width), () => decodeThumb(abs, width));
+    const run = mainChain.then(() => decodeThumb(abs, width, undefined, format), () => decodeThumb(abs, width, undefined, format));
     mainChain = run.then(() => {}, () => {});
     try {
       return await run;
@@ -441,12 +446,13 @@ export async function init(router) {
 
   /**
    * 生成缩略图（worker 优先，超队列直接放弃）
-   * @returns Buffer | null —— null 表示"应回退原图"（原图已够小 / 队列积压 / 解码失败）
+   * @param format 'jpeg' | 'webp'
+   * @returns {{ buf: Buffer, mime: string } | null} —— null 表示"应回退原图"（原图已够小 / 队列积压 / 解码失败）
    */
-  async function generateThumb(abs, width) {
+  async function generateThumb(abs, width, format) {
     if (workerBroken) {
       try {
-        return await decodeThumbOnMainThread(abs, width);
+        return await decodeThumbOnMainThread(abs, width, format);
       } catch (e) {
         console.warn('[lig-local-images] 主线程生成缩略图失败，回退原图:', fmtErr(e));
         return null;
@@ -456,13 +462,13 @@ export async function init(router) {
     return new Promise((resolve) => {
       const id = ++taskSeq;
       pendingTasks.set(id, {
-        resolve: (buf) => resolve(buf),
+        resolve: (out) => resolve(out),
         reject: (e) => {
           console.warn('[lig-local-images] 生成缩略图失败，回退原图:', fmtErr(e));
           resolve(null);
         },
       });
-      taskQueue.push({ id, abs, width });
+      taskQueue.push({ id, abs, width, format });
       drainThumbQueue();
     });
   }
@@ -493,10 +499,18 @@ export async function init(router) {
       ? Math.min(THUMB_WIDTH.max, Math.max(THUMB_WIDTH.min, Math.round(asked)))
       : THUMB_WIDTH.def;
 
-    const cacheKey = `${r.abs}|${width}`;
+    // 第62次: 按客户端 Accept 协商缩略图格式（浏览器 <img> 会自动带上 image/webp）。
+    // ?webp=0 可强制退回 JPEG，便于排查；无请求头（如 curl）默认 JPEG。
+    const wantsWebp =
+      !/^(0|false|no|off)$/i.test(String(req.query?.webp ?? '')) &&
+      /image\/webp/i.test(String(req.headers?.accept ?? ''));
+    const format = wantsWebp ? 'webp' : 'jpeg';
+
+    // 缓存键必须带格式 —— 否则 webp 与 jpeg 会互相串
+    const cacheKey = `${r.abs}|${width}|${format}`;
     const hit = thumbCache.get(cacheKey);
     if (hit) {
-      res.type('image/jpeg').set('Cache-Control', 'public, max-age=86400').send(hit);
+      res.type(hit.mime).set('Cache-Control', 'public, max-age=86400').set('Vary', 'Accept').send(hit.buf);
       return;
     }
 
@@ -504,13 +518,15 @@ export async function init(router) {
     if (!(await loadJimp())) return res.redirect(302, fallback);
 
     try {
-      const buf = await generateThumb(r.abs, width);
-      if (!buf) return res.redirect(302, fallback);
+      const out = await generateThumb(r.abs, width, format);
+      if (!out) return res.redirect(302, fallback);
       if (thumbCache.size >= THUMB_CACHE_MAX) {
         thumbCache.delete(thumbCache.keys().next().value);
       }
-      thumbCache.set(cacheKey, buf);
-      res.type('image/jpeg').set('Cache-Control', 'public, max-age=86400').send(buf);
+      thumbCache.set(cacheKey, out);
+      // ⚠️ Vary: Accept 必须带上 —— 否则中间缓存可能把 webp 响应喂给不支持 webp 的客户端。
+      // 响应格式以 out.mime 为准（webp 编码失败时会退回 jpeg）。
+      res.type(out.mime).set('Cache-Control', 'public, max-age=86400').set('Vary', 'Accept').send(out.buf);
     } catch (e) {
       console.warn('[lig-local-images] 生成缩略图失败，回退原图:', fmtErr(e));
       res.redirect(302, fallback);
