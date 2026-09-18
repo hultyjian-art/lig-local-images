@@ -14,6 +14,10 @@
  *   （实测有数十个以角色卡名命名的目录），绝不允许本插件直接操作。
  *   前端 services/galleryScope.ts 有同规则的第一层防线（双保险）。
  * - 每用户隔离：白名单存在该用户 data 目录下。
+ * - v1.0.7 放宽 jpeg-js 解码内存上限（512MB → 4096MB），修复大图缩略图全部回退原图。
+ * - v1.0.8 缩略图解码移入 worker 线程 + 队列上限 32：jimp 的同步解码会占满事件循环
+ *   （实测单张 2.1 秒），导致 /roots /tree 被阻塞、前端 30 秒超时（signal is aborted
+ *   without reason）。现在主线程不再被解码阻塞；队列积压时直接回退原图。
  * - v1.0.6 新增只读 /diag：把 user/images 与各注册根的路径归属、exists/stat/access/readdir
  *   各层结果、逐条 stat 样本全列出来，用于现场判定"目录有内容却显示为空"到底是
  *   路径错、权限被静默过滤、还是真的空。无副作用，不写盘。
@@ -22,7 +26,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { Worker } from 'node:worker_threads';
 import { cleanRel, isImage, probeReadableDir, requireBelowImagesRoot, resolveUnder } from './lib/guard.mjs';
+import { decodeThumb, loadJimp } from './lib/thumb-core.mjs';
 import { loadRoots, newRootId, saveRoots } from './lib/store.mjs';
 
 export const info = {
@@ -34,7 +40,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.0.7';
+const PLUGIN_VERSION = '1.0.8';
 
 /** 取当前用户的 user/images 绝对路径 (Luker 的 DATA_ROOT 可能是相对路径, 必须 resolve) */
 function userImages(req) {
@@ -354,53 +360,111 @@ export async function init(router) {
   const thumbCache = new Map();
   const THUMB_CACHE_MAX = 300;
 
-  /** jimp 句柄：null=未探测，false=不可用 */
-  let jimpHandle = null;
+  /**
+   * ===== 第60次：缩略图解码移入 worker 线程 =====
+   *
+   * 背景（实测）：jimp 0.22 的解码/缩放/编码都是同步 CPU 操作，6.2MB 大图单张约 2.1 秒；
+   * 期间整个 Node 事件循环被占满，/roots /tree 一并被卡住 2 秒。一页几十上百张图时会
+   * 累计成数十秒阻塞，前端请求因此 30 秒超时（signal is aborted without reason）。
+   *
+   * 现方案：解码交给 1 个常驻 worker 串行处理，主线程只做缓存与文件发送；
+   * 等待队列超过 THUMB_QUEUE_MAX 时直接 302 回退原图（宁可显原图，也不无限排队）。
+   * worker 不可用（环境受限）时回退为主线程串行解码（保持可用，性能退回旧行为）。
+   */
+  const THUMB_QUEUE_MAX = 32;
+  let thumbWorker = null;
+  let workerBroken = false;
+  let workerBusy = false;
+  let taskSeq = 0;
+  const pendingTasks = new Map(); // id -> { resolve, reject }
+  const taskQueue = [];           // 待投递任务 { id, abs, width }
+  let fallbackQueue = 0;          // 主线程回退路径的排队数
+
+  function startThumbWorker() {
+    if (thumbWorker || workerBroken) return thumbWorker;
+    try {
+      thumbWorker = new Worker(new URL('./lib/thumb-worker.mjs', import.meta.url));
+      thumbWorker.on('message', (msg) => {
+        const task = pendingTasks.get(msg?.id);
+        workerBusy = false;
+        if (task) {
+          pendingTasks.delete(msg.id);
+          if (msg.ok) task.resolve(msg.buf ? Buffer.from(msg.buf) : null);
+          else task.reject(new Error(msg.error || 'worker 解码失败'));
+        }
+        drainThumbQueue();
+      });
+      thumbWorker.on('error', (e) => {
+        workerBroken = true;
+        thumbWorker = null;
+        workerBusy = false;
+        console.warn('[lig-local-images] 缩略图 worker 异常，改用主线程解码:', fmtErr(e));
+        for (const [, task] of pendingTasks) task.reject(e);
+        pendingTasks.clear();
+        drainThumbQueue();
+      });
+      thumbWorker.on('exit', () => {
+        thumbWorker = null;
+        workerBusy = false;
+        drainThumbQueue();
+      });
+    } catch (e) {
+      workerBroken = true;
+      console.warn('[lig-local-images] 缩略图 worker 不可用，改用主线程解码:', fmtErr(e));
+    }
+    return thumbWorker;
+  }
+
+  function drainThumbQueue() {
+    if (workerBroken) return;
+    const worker = startThumbWorker();
+    if (!worker || workerBusy) return;
+    const task = taskQueue.shift();
+    if (!task) return;
+    workerBusy = true;
+    worker.postMessage(task);
+  }
+
+  /** 主线程回退路径（worker 不可用时）：串行解码，队列超限同样直接放弃 */
+  let mainChain = Promise.resolve();
+  async function decodeThumbOnMainThread(abs, width) {
+    if (fallbackQueue >= THUMB_QUEUE_MAX) return null;
+    fallbackQueue++;
+    const run = mainChain.then(() => decodeThumb(abs, width), () => decodeThumb(abs, width));
+    mainChain = run.then(() => {}, () => {});
+    try {
+      return await run;
+    } finally {
+      fallbackQueue--;
+    }
+  }
 
   /**
-   * v1.0.7: 放宽 jpeg-js 解码器的内存上限。
-   * jimp 0.x 的 jpeg 解码器 = jpeg-js.decode 裸函数（不传 opts），其默认
-   * maxMemoryUsageInMB=512MB；大图（如 8000×8000 级别的扫图/照片）解码足迹可达
-   * 700MB+，于是 /thumb 全部报 "maxMemoryUsageInMB limit exceeded" 回退原图。
-   * 这里用带大上限的 wrapper 覆盖 Jimp.decoders['image/jpeg']（jimp 0.22 的
-   * 静态可变 map，运行时查找，覆盖即生效）。覆盖失败只告警，不影响其余流程。
+   * 生成缩略图（worker 优先，超队列直接放弃）
+   * @returns Buffer | null —— null 表示"应回退原图"（原图已够小 / 队列积压 / 解码失败）
    */
-  async function raiseJpegMemoryLimit(Jimp) {
-    try {
-      if (!Jimp || typeof Jimp !== 'function' || !Jimp.decoders) return;
-      const mod = await import('jpeg-js');
-      const jpegJs = mod.default || mod;
-      if (typeof jpegJs?.decode !== 'function') return;
-      const current = Jimp.decoders['image/jpeg'];
-      // 已经是带 opts 的 wrapper（重复加载）就不再包一层
-      if (current && current.__ligPatched) return;
-      const patched = (data) => jpegJs.decode(data, { maxMemoryUsageInMB: 4096 });
-      patched.__ligPatched = true;
-      Jimp.decoders['image/jpeg'] = patched;
-    } catch (e) {
-      console.warn('[lig-local-images] 放宽 jpeg 内存上限失败（保持默认 512MB）:', fmtErr(e));
+  async function generateThumb(abs, width) {
+    if (workerBroken) {
+      try {
+        return await decodeThumbOnMainThread(abs, width);
+      } catch (e) {
+        console.warn('[lig-local-images] 主线程生成缩略图失败，回退原图:', fmtErr(e));
+        return null;
+      }
     }
-  }
-
-  async function loadJimp() {
-    if (jimpHandle !== null) return jimpHandle;
-    try {
-      const m = await import('jimp');
-      jimpHandle = m.Jimp || m.default || m;
-      await raiseJpegMemoryLimit(jimpHandle);
-    } catch (e) {
-      console.warn('[lig-local-images] jimp 不可用，缩略图将回退原图:', fmtErr(e));
-      jimpHandle = false;
-    }
-    return jimpHandle;
-  }
-
-  /** 把 CPU 密集的缩放串行化，避免多个请求同时解码把进程拖死 */
-  let thumbChain = Promise.resolve();
-  function withThumbLock(fn) {
-    const next = thumbChain.then(fn, fn);
-    thumbChain = next.then(() => {}, () => {});
-    return next;
+    if (taskQueue.length + (workerBusy ? 1 : 0) >= THUMB_QUEUE_MAX) return null;
+    return new Promise((resolve) => {
+      const id = ++taskSeq;
+      pendingTasks.set(id, {
+        resolve: (buf) => resolve(buf),
+        reject: (e) => {
+          console.warn('[lig-local-images] 生成缩略图失败，回退原图:', fmtErr(e));
+          resolve(null);
+        },
+      });
+      taskQueue.push({ id, abs, width });
+      drainThumbQueue();
+    });
   }
 
   /** 原图 URL（回退用）：直接复用 serveUrl，避免两处格式不一致 */
@@ -436,21 +500,11 @@ export async function init(router) {
       return;
     }
 
-    const jimp = await loadJimp();
-    if (!jimp) return res.redirect(302, fallback);
+    // jimp 不可用则直接回退原图（不阻塞、不报错）
+    if (!(await loadJimp())) return res.redirect(302, fallback);
 
     try {
-      const buf = await withThumbLock(async () => {
-        const img = await jimp.read(r.abs);
-        const w0 = img.bitmap?.width ?? 0;
-        const h0 = img.bitmap?.height ?? 0;
-        if (!w0 || !h0) throw new Error('无法解码图片尺寸');
-        // 已经比目标还小就不放大，直接回退原图（避免糊）
-        if (w0 <= width) return null;
-        img.resize(width, Math.max(1, Math.round((h0 * width) / w0)));
-        img.quality(72);
-        return img.getBufferAsync(jimp.MIME_JPEG);
-      });
+      const buf = await generateThumb(r.abs, width);
       if (!buf) return res.redirect(302, fallback);
       if (thumbCache.size >= THUMB_CACHE_MAX) {
         thumbCache.delete(thumbCache.keys().next().value);
