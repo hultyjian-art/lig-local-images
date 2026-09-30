@@ -15,6 +15,11 @@
  *   前端 services/galleryScope.ts 有同规则的第一层防线（双保险）。
  * - 每用户隔离：白名单存在该用户 data 目录下。
  * - v1.0.7 放宽 jpeg-js 解码内存上限（512MB → 4096MB），修复大图缩略图全部回退原图。
+ * - v1.1.2 新增 POST /copy：把「图库里的某张图」在**服务器本地**直接复制进 user/images 的图床目录。
+ *   以前「图库 → 图床」必须"原图下载到浏览器 →（压缩）→ base64 传回去"，同机绕两趟大字节
+ *   再叠 base64 的 +33%，是 900MB 大批导入最大的冤枉开销；复制不出网络，也不占浏览器内存。
+ *   边界只读不改源、目标必须在图床子目录内、撞名 409 不覆盖、失败不留半成品。
+ *   /ping 同时回 `features:['copy']`，前端据此决定走复制还是走老路（旧版插件不会被新前端打坏）。
  * - v1.1.1 回退原图也带原因 + 文件名（redirectReasons / recent），用于定位
  *   "缩略图为什么没生成"：badPath / notImage / missing / tooSmall（原图本就更小，
  *   属正常）/ queueFull（队列积压）/ decodeFailed / noJimp。
@@ -51,7 +56,13 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.1.1';
+const PLUGIN_VERSION = '1.1.2';
+/**
+ * 能力清单（v1.1.2 新增）。
+ * 前端靠它决定"图库导入走服务端复制还是走下载+重传"——探测不到就当没有，
+ * 老版插件配新前端仍然是完整可用的旧行为（新前端配老插件不能坏）。
+ */
+const PLUGIN_FEATURES = ['copy'];
 
 /**
  * 缩略图 URL 的版本号（第62次新增，跟随 WebP 协商一起发布）。
@@ -261,7 +272,7 @@ export async function init(router) {
   router.get('/ping', wrap(async (req, res) => {
     // ?reset=1 清零缩略图统计 —— 方便"清缓存 → 浏览图库 → 再看计数"的自查流程
     if (/^(1|true|yes|on)$/i.test(String(req.query?.reset ?? ''))) resetThumbStats();
-    res.json({ ok: true, name: info.name, version: PLUGIN_VERSION, api: API_VERSION, thumb: thumbStatsSnapshot() });
+    res.json({ ok: true, name: info.name, version: PLUGIN_VERSION, api: API_VERSION, features: PLUGIN_FEATURES, thumb: thumbStatsSnapshot() });
   }));
 
   // ============ 只读图床：根管理 ============
@@ -665,6 +676,78 @@ export async function init(router) {
     fs.writeFileSync(abs, Buffer.from(b64, 'base64'));
     const st = fs.statSync(abs);
     res.json({ ok: true, path: `${dir.cleaned}/${filename}`, size: st.size });
+  }));
+
+  /**
+   * 服务端复制一张图到 user/images 之下（v1.1.2 新增，供「图库 → 图床」免下载免重传）。
+   *
+   * 为什么加它：这条路原本要把原图**下载回浏览器**（可能再压一遍）然后用 base64 **传回来**。
+   * 同一台机器上绕两趟大字节，还叠加 base64 的 +33% 体积与请求体上限风险 ——
+   * 实测一批 131 张 / 900MB 里，这是最大的一笔冤枉开销。源和目标都在服务器磁盘上，
+   * 复制本该是一次文件系统动作。
+   *
+   * 安全边界取"读侧 /file 的判据"与"写侧 /upload 的判据"的**交集**，两边都不放宽：
+   * - 源：必须落在已注册根（含内置 library）之内 —— `resolveUnder` 挡掉 `..` 穿越；
+   *        必须是受支持的图片扩展名；必须是已存在的普通文件。
+   * - 目标：必须位于 user/images 之下（`resolveWritePath`），且必须在某个**子目录内**
+   *        （`requireBelowImagesRoot`：images 根层是酒馆自己的数据目录，插件不得直接写）。
+   * - 绝不覆盖：目标已存在 → 409；源与目标同一个文件 → 400。
+   * - 只读契约不破：本端点不改源、不删源，外部根仍然是只读的（别把它当 move/delete 的入口扩展）。
+   *
+   * 为什么"先写隐藏临时文件再 rename"：copyFile 对几 MB 的文件不是瞬时的，
+   * 中途失败（磁盘满、进程被杀）若直接落在最终文件名上，会留下一个"看着是图片其实半截"的文件，
+   * 而且之后每次重试都被 409 挡死、永远清不掉。临时名 + rename 保证终名下只可能出现完整文件；
+   * 临时文件以 `.` 开头，正好落在 `scanDir` 跳过的隐藏条目里，即使极端情况残留也不会出现在图库。
+   * 已知代价：并发同名时 rename 会覆盖前一份 —— 需要"前端去重失效 + 服务端预检通过"两件事同时
+   * 发生才会撞（前端按 主名_2 顺延、这里先 409 预检），写在此处以免被当成漏洞重复讨论。
+   *
+   * 全程用 fs.promises：复制是这条链路上唯一可能占住主线程几十毫秒的动作，
+   * 而第60次的教训正是"主线程一被占满，前端所有请求一起 30 秒超时"。
+   */
+  let copyPartSeq = 1;
+  router.post('/copy', wrap(async (req, res) => {
+    const rootRef = resolveRootBase(req, String(req.body?.fromRoot ?? ''));
+    if (!rootRef) return res.status(404).json({ error: '源根不存在（未注册或已被移除）' });
+    const fromRel = cleanRel(String(req.body?.fromPath ?? ''));
+    if (!fromRel) return res.status(400).json({ error: '缺少源文件路径' });
+    const src = resolveUnder(rootRef.baseAbs, fromRel);
+    if (!src.ok) return res.status(src.code).json({ error: src.error });
+    if (!isImage(src.abs)) return res.status(403).json({ error: '仅允许图片文件' });
+    let srcStat = null;
+    try { srcStat = await fs.promises.stat(src.abs); } catch { /* 源不存在，下面统一返回 404 */ }
+    if (!srcStat || !srcStat.isFile()) return res.status(404).json({ error: '源文件不存在' });
+
+    const dir = resolveWritePath(req, String(req.body?.to ?? ''));
+    if (!dir.ok) return res.status(dir.code).json({ error: dir.error });
+    const filename = cleanRel(String(req.body?.filename ?? ''));
+    if (!filename || filename.includes('/')) return res.status(400).json({ error: '非法文件名' });
+    if (!isImage(filename)) return res.status(403).json({ error: '仅允许图片文件' });
+    // 根层保护按**文件自身的完整路径**判（与 /upload 的落点、前端 assertInsideGalleryDir 同一条口径）：
+    // `local_images/a.png` 两段 ⇒ 合法；万一拼出 `a.png` 一段 ⇒ 那是直接写 images 根层，拒绝。
+    // ⚠️ 不要改成对目录校验：`local_images` 只有一段，那样"导入到存储根、不建子文件夹"
+    //    这个最常见的用法会被自己的保护挡死。
+    const depth = requireBelowImagesRoot(`${dir.cleaned}/${filename}`);
+    if (!depth.ok) return res.status(depth.code).json({ error: depth.error });
+
+    const abs = path.join(dir.abs, filename);
+    if (path.resolve(abs) === path.resolve(src.abs)) {
+      return res.status(400).json({ error: '源与目标是同一个文件（这张已经在目标文件夹里）' });
+    }
+    if (fs.existsSync(abs)) return res.status(409).json({ error: '目标文件已存在' });
+
+    await fs.promises.mkdir(dir.abs, { recursive: true });
+    // 临时名带进程号与序号：同目录里并发复制彼此不撞车
+    const part = path.join(dir.abs, `.${filename}.lig-part-${process.pid}-${copyPartSeq++}`);
+    try {
+      await fs.promises.copyFile(src.abs, part);
+      await fs.promises.rename(part, abs);
+    } catch (e) {
+      // 半成品绝不留在最终文件名上：清掉临时文件，原因原样报给前端
+      await fs.promises.unlink(part).catch(() => { /* 没写成就没得删 */ });
+      throw e;
+    }
+    const st = await fs.promises.stat(abs);
+    res.json({ ok: true, path: `${dir.cleaned}/${filename}`, size: st.size, copied: true });
   }));
 
   router.post('/rename', wrap(async (req, res) => {
