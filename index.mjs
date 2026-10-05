@@ -15,6 +15,17 @@
  *   前端 services/galleryScope.ts 有同规则的第一层防线（双保险）。
  * - 每用户隔离：白名单存在该用户 data 目录下。
  * - v1.0.7 放宽 jpeg-js 解码内存上限（512MB → 4096MB），修复大图缩略图全部回退原图。
+ * - v1.1.3 缩略图**磁盘缓存** + worker 永久降级修复 + `POST /thumb/clear`（第87次，配套脚本改动）：
+ *   ①小图第一次生成后按「文件绝对路径+宽+格式+原图 mtime+size」落盘到用户数据目录下的
+ *   `lig-local-images.thumbs/`，重启酒馆不再重做 —— 以前缓存只在内存里（300 张、且按插入序
+ *   逐出而非按新鲜度），服务端一重启就全部重来，这是用户报"每次浏览都要等一堆黑块"的主因；
+ *   ②`GET /thumb` 命中磁盘缓存时**不占解码队列**，直接发文件；
+ *   ③worker 一旦 `error` 就**永久**退回主线程同步解码（实测单张 2.1 秒占满事件循环，
+ *   `/tree` 被挤到 30 秒超时 ⇒ 用户看到的"该目录为空""插件请求失败：目录不可读"多半是它），
+ *   现在改成"有界兜底 + 定时重生 worker"；④缩略图 URL 带上原图指纹 `&k=`，
+ *   响应头因此可以 `max-age=1 年, immutable` —— 同一张没动过的图浏览器再也不来问；
+ *   ⑤新增 `POST /thumb/clear` 真清缓存（内存 + 磁盘），前端设置里那个按钮终于接得上。
+ *   /ping 回 `features` 增加 `'thumb-cache'`，前端据此决定按钮走不走新端点（旧插件不会被打坏）。
  * - v1.1.2 新增 POST /copy：把「图库里的某张图」在**服务器本地**直接复制进 user/images 的图床目录。
  *   以前「图库 → 图床」必须"原图下载到浏览器 →（压缩）→ base64 传回去"，同机绕两趟大字节
  *   再叠 base64 的 +33%，是 900MB 大批导入最大的冤枉开销；复制不出网络，也不占浏览器内存。
@@ -39,6 +50,7 @@
  *   路径错、权限被静默过滤、还是真的空。无副作用，不写盘。
  */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -56,13 +68,13 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.1.2';
+const PLUGIN_VERSION = '1.1.3';
 /**
- * 能力清单（v1.1.2 新增）。
- * 前端靠它决定"图库导入走服务端复制还是走下载+重传"——探测不到就当没有，
- * 老版插件配新前端仍然是完整可用的旧行为（新前端配老插件不能坏）。
+ * 能力清单。
+ * 前端靠它决定"图库导入走服务端复制还是走下载+重传"、"清空缩略图缓存按钮走新端点还是退回旧行为"
+ * —— 探测不到就当没有，老版插件配新前端仍然是完整可用的旧行为（新前端配老插件不能坏）。
  */
-const PLUGIN_FEATURES = ['copy'];
+const PLUGIN_FEATURES = ['copy', 'thumb-cache'];
 
 /**
  * 缩略图 URL 的版本号（第62次新增，跟随 WebP 协商一起发布）。
@@ -74,8 +86,11 @@ const PLUGIN_FEATURES = ['copy'];
  * 递增此版本号即生成全新 URL，直接绕过所有旧缓存条目。
  *
  * ⚠️ 只在"缩略图管道语义变了、必须让客户端重新拉取"时递增，别当成普通构建号用。
+ *
+ * 第87次升到 3：响应从 `max-age=86400` 变成带原图指纹的 `max-age=1 年, immutable`，
+ * 且服务端多了磁盘缓存 —— 老 URL 上残留的 24 小时缓存条目必须整体绕开。
  */
-const THUMB_URL_VERSION = 2;
+const THUMB_URL_VERSION = 3;
 
 /** 取当前用户的 user/images 绝对路径 (Luker 的 DATA_ROOT 可能是相对路径, 必须 resolve) */
 function userImages(req) {
@@ -134,7 +149,8 @@ function scanDir(abs, urlFor, thumbFor) {
         size = st.size;
         mtime = Math.floor(st.mtimeMs);
       } catch { /* 忽略单个文件的元数据失败 */ }
-      images.push({ name: ent.name, size, mtime, url: urlFor(ent.name), thumb: thumbFor ? thumbFor(ent.name) : undefined });
+      // 第87次: thumbFor 多收一份 {size, mtime} —— 缩略图 URL 要带原图指纹，浏览器才敢长期缓存
+      images.push({ name: ent.name, size, mtime, url: urlFor(ent.name), thumb: thumbFor ? thumbFor(ent.name, { size, mtime }) : undefined });
     }
     scanned++;
   }
@@ -372,7 +388,7 @@ export async function init(router) {
     const { dirs, images, meta } = scanDir(
       r.abs,
       name => serveUrl(rootRef.id, dirRel, name),
-      name => serveThumbUrl(rootRef.id, dirRel, name),
+      (name, meta) => serveThumbUrl(rootRef.id, dirRel, name, 320, meta),
     );
     res.json({ dirs, images, meta });
   }));
@@ -394,9 +410,145 @@ export async function init(router) {
   // 保证图片始终能显示（不会因为缺依赖把功能弄坏）。
   const THUMB_WIDTH = { min: 64, max: 640, def: 320 };
 
-  /** 缩略图内存缓存（Map 按插入序，超上限逐出最早的） */
+  /** 缩略图内存缓存（Map 按插入序；第87次起**命中会重新 set** ⇒ 变成真正的 LRU） */
   const thumbCache = new Map();
   const THUMB_CACHE_MAX = 300;
+
+  /**
+   * ===== 缩略图磁盘缓存（v1.1.3，第87次）=====
+   *
+   * 为什么必须有：以前小图只活在 `thumbCache` 这个内存 Map 里（300 张、按插入序逐出），
+   * 服务端一重启就全部清零；而 jimp 一张 6 MB 的图要解 2 秒左右，于是一页几十张就是
+   * 几十秒排队 —— 用户报的"打开某个文件夹全是黑块、切到图库说目录为空、再过一会儿才出图"
+   * 全在这条队上。落盘之后：**每张图一辈子只解一次**，重启、切脚本、换聊天都不影响。
+   *
+   * 键为什么带原图的 mtime 与 size：这就是失效机制本身 —— 图片被覆盖/换掉后指纹变了，
+   * 自然走新键重新生成，老键留在那儿等逐出。不需要 TTL，也不需要"检测文件变了"的额外逻辑。
+   * 反过来，如果只按路径当键，用户换掉一张同名图就会永远看到旧的那张。
+   *
+   * 目录选在用户数据根（与 `lig-local-images.roots.json` 同级）：
+   * 按用户隔离、不进 git、酒馆升级不会被清；拿不到（例如未登录）就退回纯内存，功能不减。
+   */
+  const THUMB_DISK_DIR = 'lig-local-images.thumbs';
+  /** 磁盘缓存条目上限（张）。超了按 mtime 逐出最老的 —— 缩略图是可再生物，删掉最多慢一次，不丢用户的东西 */
+  const THUMB_DISK_MAX_FILES = 8000;
+  /** 每写 N 张查一次是否超限（每次请求都 readdir 不划算） */
+  const THUMB_DISK_PRUNE_EVERY = 200;
+  const thumbDiskStats = { hits: 0, writes: 0, failed: 0, pruned: 0, dir: null };
+  let thumbDiskWriteCount = 0;
+
+  /** 本用户的缩略图缓存目录（与 roots.json 同处用户数据根）；拿不到返回 null = 只走内存 */
+  function thumbDiskDirOf(req) {
+    const root = req.user?.directories?.root;
+    if (!root) return null;
+    const dir = path.resolve(path.join(String(root), THUMB_DISK_DIR));
+    thumbDiskStats.dir = dir;
+    return dir;
+  }
+
+  /** 缓存指纹：路径 + 宽 + 格式 + 原图 mtime + 原图 size。任一变了就是另一张图 */
+  function thumbFingerprint(abs, width, format, mtimeMs, size) {
+    return crypto.createHash('sha1').update(`${abs}|${width}|${format}|${Math.round(mtimeMs || 0)}|${size || 0}`).digest('hex');
+  }
+
+  function thumbDiskPathOf(dir, key, format) {
+    return path.join(dir, `${key}.${format === 'webp' ? 'webp' : 'jpg'}`);
+  }
+
+  /** 按**实际编码出的 mime** 定文件名（webp 编码失败退成 jpeg 时不能挂着 .webp 存 jpeg 字节） */
+  function thumbDiskPathForMime(dir, key, mime) {
+    return path.join(dir, `${key}.${mime === 'image/webp' ? 'webp' : 'jpg'}`);
+  }
+
+  /**
+   * 找这张图在磁盘上的缓存。
+   * 两种扩展名都找一遍：客户端按 Accept 协商，同一张图可能先前已被别的客户端存成 jpeg。
+   * 找到就照它**自己的**格式回（mime 由扩展名定，写入侧就是按实际格式命名的，两者对得上）。
+   */
+  function findThumbOnDisk(dir, key) {
+    for (const ext of ['.webp', '.jpg']) {
+      const file = path.join(dir, `${key}${ext}`);
+      const buf = readThumbDisk(file);
+      if (buf && buf.length) {
+        return { file, buf, mime: ext === '.webp' ? 'image/webp' : 'image/jpeg' };
+      }
+    }
+    return null;
+  }
+
+  /** 读磁盘缓存（不存在/读不了 = null，交由调用方回退到生成） */
+  function readThumbDisk(file) {
+    try {
+      return fs.statSync(file).isFile() ? fs.readFileSync(file) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 写磁盘缓存：先写 .tmp 再 rename，所以终名下只可能出现完整文件（与 /copy 同一套纪律） */
+  function writeThumbDisk(dir, file, buf) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const tmp = `${file}.${process.pid}.${Date.now().toString(36)}.tmp`;
+      fs.writeFileSync(tmp, buf);
+      fs.renameSync(tmp, file);
+      thumbDiskStats.writes++;
+      if (++thumbDiskWriteCount % THUMB_DISK_PRUNE_EVERY === 0) pruneThumbDisk(dir);
+      return true;
+    } catch (e) {
+      // 磁盘满/权限只意味着"这次没存下"，不该把已经生成好的小图扣住不给
+      thumbDiskStats.failed++;
+      console.warn('[lig-local-images] 缩略图写盘失败（不影响本次显示）:', fmtErr(e));
+      return false;
+    }
+  }
+
+  /** 按 mtime 逐出最老的，把条目数压回上限内 */
+  function pruneThumbDisk(dir) {
+    try {
+      const names = fs.readdirSync(dir).filter(n => n.endsWith('.webp') || n.endsWith('.jpg'));
+      if (names.length <= THUMB_DISK_MAX_FILES) return 0;
+      const withTime = names.map(n => {
+        try {
+          return { n, m: fs.statSync(path.join(dir, n)).mtimeMs };
+        } catch {
+          return { n, m: 0 };
+        }
+      });
+      withTime.sort((a, b) => a.m - b.m);
+      let dropped = 0;
+      for (const it of withTime.slice(0, withTime.length - THUMB_DISK_MAX_FILES)) {
+        try {
+          fs.rmSync(path.join(dir, it.n), { force: true });
+          dropped++;
+        } catch { /* 单条删不掉就跳过，别让逐出把请求带崩 */ }
+      }
+      thumbDiskStats.pruned += dropped;
+      if (dropped) console.info(`[lig-local-images] 缩略图磁盘缓存逐出 ${dropped} 张（超过 ${THUMB_DISK_MAX_FILES} 张上限）`);
+      return dropped;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** 内存 + 磁盘一起清，返回清掉的条数（POST /thumb/clear 用） */
+  function clearThumbCaches(dir) {
+    const ram = thumbCache.size;
+    thumbCache.clear();
+    let files = 0;
+    if (dir) {
+      try {
+        for (const n of fs.readdirSync(dir)) {
+          if (!/\.(webp|jpg|tmp)$/i.test(n)) continue;
+          fs.rmSync(path.join(dir, n), { force: true });
+          files++;
+        }
+      } catch (e) {
+        console.warn('[lig-local-images] 清空缩略图磁盘缓存失败:', fmtErr(e));
+      }
+    }
+    return { ram, files };
+  }
 
   /**
    * 缩略图格式统计（第63次新增，v1.1.0）。
@@ -430,6 +582,7 @@ export async function init(router) {
    *   missing        文件不存在或不是文件
    *   tooSmall       原图宽度 ≤ 请求宽度（本就不需要缩略图，属正常）
    *   queueFull      等待队列积压（超过 THUMB_QUEUE_MAX，主动放弃以免拖死）
+   *   noWorker       worker 不可用且主线程代解额度已用满（第87次新增，宁可不缩也不卡住整只插件）
    *   decodeFailed   解码/编码抛错（jimp 不可用、大图内存、文件损坏…）
    *   noJimp         jimp 加载失败
    */
@@ -451,6 +604,8 @@ export async function init(router) {
       redirectedToOriginal: thumbStats.redirected,
       redirectReasons: { ...thumbStats.reasons },
       errors: thumbStats.errors,
+      // 第87次：磁盘缓存的账（hits=直接发盘上小图的次数）。他要看数字，就把数字给到 /ping 与 /diag
+      disk: { ...thumbDiskStats, ram: thumbCache.size },
       recent: thumbStats.last.slice(),
     };
   }
@@ -462,6 +617,11 @@ export async function init(router) {
     thumbStats.errors = 0;
     thumbStats.last.length = 0;
     thumbStats.reasons = {};
+    // 磁盘计数一起清零（它与 /ping?reset=1 是同一件事：自查前归零，浏览几页后再看）
+    thumbDiskStats.hits = 0;
+    thumbDiskStats.writes = 0;
+    thumbDiskStats.failed = 0;
+    thumbDiskStats.pruned = 0;
   }
 
   /**
@@ -476,8 +636,21 @@ export async function init(router) {
    * worker 不可用（环境受限）时回退为主线程串行解码（保持可用，性能退回旧行为）。
    */
   const THUMB_QUEUE_MAX = 32;
+  /**
+   * worker 报错后隔多久再试着重起一个（第87次）。
+   * 老写法是 `workerBroken = true` 从此不再回头 —— 一次偶发的 worker 异常就换来
+   * **永久**退回主线程同步解码，而主线程解码每张占死事件循环约 2 秒，
+   * `/tree`、`/roots` 全被挤到 30 秒超时。用户报的"切目录说目录不可读""图库显示该目录为空"
+   * 大概率就是这条降级链的产物（现象上是"卡"，不是"错"）。
+   */
+  const WORKER_RETRY_MS = 30_000;
+  /** worker 不可用期间，最多让主线程代解几张；超过就改回原图，绝不拿事件循环去换缩略图 */
+  const MAIN_FALLBACK_MAX = 5;
   let thumbWorker = null;
   let workerBroken = false;
+  let workerBrokenAt = 0;
+  /** 本轮 worker 缺席期间已经让主线程代解的张数（worker 一起来就清零） */
+  let mainFallbackUsed = 0;
   let workerBusy = false;
   let taskSeq = 0;
   const pendingTasks = new Map(); // id -> { resolve, reject }
@@ -488,6 +661,8 @@ export async function init(router) {
     if (thumbWorker || workerBroken) return thumbWorker;
     try {
       thumbWorker = new Worker(new URL('./lib/thumb-worker.mjs', import.meta.url));
+      // 新 worker 起来了 ⇒ 主线程代解的额度重新给满（判据见 MAIN_FALLBACK_MAX）
+      mainFallbackUsed = 0;
       thumbWorker.on('message', (msg) => {
         const task = pendingTasks.get(msg?.id);
         workerBusy = false;
@@ -502,26 +677,40 @@ export async function init(router) {
       });
       thumbWorker.on('error', (e) => {
         workerBroken = true;
+        workerBrokenAt = Date.now();
         thumbWorker = null;
         workerBusy = false;
-        console.warn('[lig-local-images] 缩略图 worker 异常，改用主线程解码:', fmtErr(e));
+        console.warn('[lig-local-images] 缩略图 worker 异常，暂时改用主线程解码（有上限，且稍后重试起 worker）:', fmtErr(e));
         for (const [, task] of pendingTasks) task.reject(e);
         pendingTasks.clear();
         drainThumbQueue();
       });
-      thumbWorker.on('exit', () => {
+      thumbWorker.on('exit', (code) => {
         thumbWorker = null;
         workerBusy = false;
+        // 非正常退出同样标记为"坏了"并进入重试冷却 —— 否则一个"起来就崩"的 worker
+        // 会被 drainThumbQueue 每次排队都重 spawn 一遍，把日志刷爆还可能拖住请求。
+        if (code !== 0) {
+          workerBroken = true;
+          workerBrokenAt = Date.now();
+          console.warn(`[lig-local-images] 缩略图 worker 异常退出(code=${code})，进入重试冷却`);
+        }
         drainThumbQueue();
       });
     } catch (e) {
       workerBroken = true;
-      console.warn('[lig-local-images] 缩略图 worker 不可用，改用主线程解码:', fmtErr(e));
+      workerBrokenAt = Date.now();
+      console.warn('[lig-local-images] 缩略图 worker 不可用，改用主线程解码（有上限）:', fmtErr(e));
     }
     return thumbWorker;
   }
 
   function drainThumbQueue() {
+    // 冷却期一过就先试着重起 worker（第87次）：以前这里是一次性判死，再也不会回头
+    if (workerBroken && Date.now() - workerBrokenAt >= WORKER_RETRY_MS) {
+      workerBroken = false;
+      console.info('[lig-local-images] 重试启动缩略图 worker');
+    }
     if (workerBroken) return;
     const worker = startThumbWorker();
     if (!worker || workerBusy) return;
@@ -531,11 +720,19 @@ export async function init(router) {
     worker.postMessage(task);
   }
 
-  /** 主线程回退路径（worker 不可用时）：串行解码，队列超限同样直接放弃 */
+  /**
+   * 主线程回退路径（worker 不可用时）。
+   * ⚠️ 有额度上限（`MAIN_FALLBACK_MAX`）：jimp 在主线程是**同步**解码，每张约占 2 秒，
+   * 期间 `/tree` `/roots` 一个都进不来。额度用满就改回原图（302，不占解码），
+   * 宁可让小图暂时大一点，也不能让整只插件失去响应 —— 第60次那条评论说的就是这件事，
+   * 但当时只限制了"排队数"，没限制"总额"，于是 worker 永久降级后照样能无限期卡住主线程。
+   */
   let mainChain = Promise.resolve();
   async function decodeThumbOnMainThread(abs, width, format) {
     if (fallbackQueue >= THUMB_QUEUE_MAX) return { reason: 'queueFull' };
+    if (mainFallbackUsed >= MAIN_FALLBACK_MAX) return { reason: 'noWorker' };
     fallbackQueue++;
+    mainFallbackUsed++;
     const run = mainChain.then(() => decodeThumb(abs, width, undefined, format), () => decodeThumb(abs, width, undefined, format));
     mainChain = run.then(() => {}, () => {});
     try {
@@ -596,8 +793,12 @@ export async function init(router) {
       noteRedirect('notImage', relPath);
       return res.redirect(302, fallback);
     }
+    // 第87次: 这里顺手把 mtime/size 取回来 —— 磁盘缓存的指纹要用，多一次 statSync 换掉
+    // "每次重启都重解整页图"是划算的（下面所有分支都用得到同一份）
+    let fileStat = null;
     try {
-      if (!fs.existsSync(r.abs) || !fs.statSync(r.abs).isFile()) {
+      fileStat = fs.statSync(r.abs);
+      if (!fileStat.isFile()) {
         noteRedirect('missing', relPath);
         return res.redirect(302, fallback);
       }
@@ -618,12 +819,44 @@ export async function init(router) {
       /image\/webp/i.test(String(req.headers?.accept ?? ''));
     const format = wantsWebp ? 'webp' : 'jpeg';
 
-    // 缓存键必须带格式 —— 否则 webp 与 jpeg 会互相串
-    const cacheKey = `${r.abs}|${width}|${format}`;
+    // 缓存键必须带格式 —— 否则 webp 与 jpeg 会互相串。
+    // 第87次: 键与磁盘文件名都带上**原图指纹**（mtime+size）—— 用户换掉一张同名图时必须重生成，
+    // 不能一直发旧的那张小图。有了这个指纹就不需要 TTL，也不需要"检测文件变了"的额外逻辑。
+    const fileTag = `${Math.round(fileStat.mtimeMs)}-${fileStat.size}`;
+    const stamp = thumbFingerprint(r.abs, width, format, fileStat.mtimeMs, fileStat.size);
+    const cacheKey = `${r.abs}|${width}|${format}|${fileTag}`;
+    const diskDir = thumbDiskDirOf(req);
+    // 只有 URL 自己带了指纹 `k` 且与当前文件一致，才敢声明 immutable ——
+    // 老前端不带 k（或这张图刚被换过），给它一年缓存等于让它一直看旧图。
+    const cacheHeader = String(req.query?.k ?? '') === fileTag && fileTag !== ''
+      ? 'public, max-age=31536000, immutable'
+      : 'public, max-age=86400';
+
+    /** 写内存缓存。第87次起命中也会走这里刷新顺序 —— 以前的 `.get` 不动位置，"LRU"其实是 FIFO */
+    function rememberRam(out) {
+      if (thumbCache.size >= THUMB_CACHE_MAX && !thumbCache.has(cacheKey)) {
+        thumbCache.delete(thumbCache.keys().next().value);
+      }
+      thumbCache.set(cacheKey, out);
+    }
+
     const hit = thumbCache.get(cacheKey);
     if (hit) {
-      res.type(hit.mime).set('Cache-Control', 'public, max-age=86400').set('Vary', 'Accept').send(hit.buf);
+      rememberRam(hit);
+      res.type(hit.mime).set('Cache-Control', cacheHeader).set('Vary', 'Accept').send(hit.buf);
       return;
+    }
+
+    // 磁盘缓存命中 ⇒ 一次 readFileSync 完事：不解码、不进解码队列、不占 worker
+    if (diskDir) {
+      const found = findThumbOnDisk(diskDir, stamp);
+      if (found) {
+        thumbDiskStats.hits++;
+        const out = { buf: found.buf, mime: found.mime };
+        rememberRam(out);
+        res.type(out.mime).set('Cache-Control', cacheHeader).set('Vary', 'Accept').send(out.buf);
+        return;
+      }
     }
 
     // jimp 不可用则直接回退原图（不阻塞、不报错）
@@ -638,20 +871,41 @@ export async function init(router) {
         noteRedirect(out.reason || 'unknown', relPath);
         return res.redirect(302, fallback);
       }
-      if (thumbCache.size >= THUMB_CACHE_MAX) {
-        thumbCache.delete(thumbCache.keys().next().value);
-      }
-      thumbCache.set(cacheKey, out);
+      rememberRam(out);
+      // 落盘按**实际编码出来的**格式命名：webp 编码失败退成 jpeg 时，不能把 jpeg 字节存成 .webp，
+      // 否则下次命中会照着扩展名把 Content-Type 报错。
+      if (diskDir) writeThumbDisk(diskDir, thumbDiskPathForMime(diskDir, stamp, out.mime), out.buf);
       noteThumb(out.mime, width, relPath);
       // ⚠️ Vary: Accept 必须带上 —— 否则中间缓存可能把 webp 响应喂给不支持 webp 的客户端。
       // 响应格式以 out.mime 为准（webp 编码失败时会退回 jpeg）。
-      res.type(out.mime).set('Cache-Control', 'public, max-age=86400').set('Vary', 'Accept').send(out.buf);
+      res.type(out.mime).set('Cache-Control', cacheHeader).set('Vary', 'Accept').send(out.buf);
     } catch (e) {
       thumbStats.errors++;
       noteRedirect('decodeFailed', relPath);
       console.warn('[lig-local-images] 生成缩略图失败，回退原图:', fmtErr(e));
       res.redirect(302, fallback);
     }
+  }));
+
+  /**
+   * 清空缩略图缓存（第87次新增）。
+   *
+   * 为什么单独开一条：设置面板里那个「清空缩略图缓存」按钮以前只清浏览器侧的 blob 表，
+   * 而插件模式下网格的图根本不走那条路 —— 于是用户按了等于没按（他第87次明确报告"近乎没用"）。
+   * 现在内存与磁盘一起清，并把清掉的条数回给他，按没按得动当场可判定。
+   */
+  router.post('/thumb/clear', wrap(async (req, res) => {
+    const dir = thumbDiskDirOf(req);
+    if (dir) {
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+      } catch (e) {
+        console.warn('[lig-local-images] 缩略图缓存目录创建失败（清空仍会作用于内存缓存）:', fmtErr(e));
+      }
+    }
+    const cleared = clearThumbCaches(dir);
+    console.info(`[lig-local-images] 已清空缩略图缓存：内存 ${cleared.ram} 张、磁盘 ${cleared.files} 个文件`);
+    res.json({ ok: true, ...cleared, dir });
   }));
 
   // ============ user/images 嵌套管理 ============
@@ -909,10 +1163,17 @@ function serveUrl(rootId, dirRel, name) {
  * 缩略图 URL（v1.0.6）。
  * 一律走插件自己的 /thumb —— 内置 library 根不能用 serveUrl 的 /user/images 直接缩放，
  * 而 /thumb 两端都能统一处理。宽度固定传 320：网格单元约 96~140px，2x 屏也够清晰。
+ *
+ * 第87次新增 `meta`（`{size, mtime}`，`/tree` 顺手 stat 到的那份）→ 拼成 `&k=<mtime>-<size>`：
+ * 它让"这张图的缩略图"这件事在浏览器里也有了一个随内容变化的地址。服务端只在
+ * `k` 与该文件当前的 mtime+size 一致时才回 `immutable, max-age=1 年`，
+ * 于是**同一张没动过的图，浏览器一辈子只问一次**；图被换掉则 k 变、地址变、重新取。
+ * 这是对"每次重进都要等一堆黑块"最省的一刀：省掉的不是服务器解码，是整趟网络往返。
  */
-function serveThumbUrl(rootId, dirRel, name, width = 320) {
+function serveThumbUrl(rootId, dirRel, name, width = 320, meta) {
   const rel = dirRel ? `${dirRel}/${name}` : name;
-  return `/api/plugins/${info.id}/thumb?root=${encodeURIComponent(rootId)}&path=${encodeURIComponent(rel)}&w=${width}&v=${THUMB_URL_VERSION}`;
+  const tag = meta ? `${Math.round(meta.mtime || 0)}-${meta.size || 0}` : '';
+  return `/api/plugins/${info.id}/thumb?root=${encodeURIComponent(rootId)}&path=${encodeURIComponent(rel)}&w=${width}&v=${THUMB_URL_VERSION}${tag ? `&k=${encodeURIComponent(tag)}` : ''}`;
 }
 
 export async function exit() {
