@@ -68,13 +68,13 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.1.3';
+const PLUGIN_VERSION = '1.1.4';
 /**
  * 能力清单。
  * 前端靠它决定"图库导入走服务端复制还是走下载+重传"、"清空缩略图缓存按钮走新端点还是退回旧行为"
  * —— 探测不到就当没有，老版插件配新前端仍然是完整可用的旧行为（新前端配老插件不能坏）。
  */
-const PLUGIN_FEATURES = ['copy', 'thumb-cache'];
+const PLUGIN_FEATURES = ['copy', 'thumb-cache', 'tree-id'];
 
 /**
  * 缩略图 URL 的版本号（第62次新增，跟随 WebP 协商一起发布）。
@@ -113,7 +113,16 @@ function wrap(handler) {
 }
 
 /** 单层扫描目录（懒加载友好）；meta 供前端区分"真空目录"与"条目读不了" */
-function scanDir(abs, urlFor, thumbFor) {
+/** 目录 realpath（失败退回原样）：把 /sdcard 这类挂载别名收敛成同一条路径，只用于算 idKey */
+function realpathOrNull(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+function scanDir(abs, urlFor, thumbFor, idBase) {
   const dirs = [];
   const images = [];
   const entries = fs.readdirSync(abs, { withFileTypes: true });
@@ -150,13 +159,30 @@ function scanDir(abs, urlFor, thumbFor) {
         mtime = Math.floor(st.mtimeMs);
       } catch { /* 忽略单个文件的元数据失败 */ }
       // 第87次: thumbFor 多收一份 {size, mtime} —— 缩略图 URL 要带原图指纹，浏览器才敢长期缓存
-      images.push({ name: ent.name, size, mtime, url: urlFor(ent.name), thumb: thumbFor ? thumbFor(ent.name, { size, mtime }) : undefined });
+      // 第90次: idKey = 这个文件在磁盘上的身份（sha1 绝对路径，只发哈希不发路径）。
+      //        随机池靠它在"同一个文件被两条来源各扫一遍"时只算一份。前端自己拼
+      //        「根 + 相对路径」挡不住挂载别名（安卓 /sdcard 与 /storage/emulated/0 是同一块存储）、
+      //        符号链接与大小写差异 ⇒ 同一文件算成两个身份 ⇒ 双倍抽中率。
+      //        目录那一层已在 /tree 里 realpath 过一次（每次请求一次系统调用，不是每张图一次），
+      //        所以两种写法会归到同一个键；哈希由服务端算，绝对路径不外泄。
+      const idPath = idBase ? path.join(idBase, ent.name) : full;
+      images.push({ name: ent.name, size, mtime, idKey: fileIdKey(idPath), url: urlFor(ent.name), thumb: thumbFor ? thumbFor(ent.name, { size, mtime }) : undefined });
     }
     scanned++;
   }
   dirs.sort((a, b) => a.localeCompare(b, 'zh-CN', { numeric: true }));
   images.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
   return { dirs, images, meta: { scanned, skipped } };
+}
+
+/**
+ * 文件磁盘身份（v1.1.4）。
+ * 归一化：反斜杠→正斜杠、合并重复斜杠、转小写（Windows 与安卓 SAF 都不分大小写）。
+ * 只回哈希不回绝对路径：客户端要的是"是不是同一个文件"，不是"它在 C 盘哪里"。
+ */
+function fileIdKey(absPath) {
+  const norm = String(absPath).replace(/\\/g, '/').replace(/\/{2,}/g, '/').trim().toLowerCase();
+  return crypto.createHash('sha1').update(norm).digest('hex').slice(0, 16);
 }
 
 /** 错误短格式（带 errno code，便于一眼看出 EACCES / ENOENT） */
@@ -385,10 +411,12 @@ export async function init(router) {
     if (!r.ok) return res.status(r.code).json({ error: r.error });
     const err = probeReadableDir(r.abs);
     if (err) return res.status(404).json({ error: err });
+    // 第90次: 整次请求只做一次 realpath（不是每张图一次），把挂载别名收敛掉再算 idKey
     const { dirs, images, meta } = scanDir(
       r.abs,
       name => serveUrl(rootRef.id, dirRel, name),
       (name, meta) => serveThumbUrl(rootRef.id, dirRel, name, 320, meta),
+      realpathOrNull(r.abs),
     );
     res.json({ dirs, images, meta });
   }));
