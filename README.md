@@ -1,4 +1,4 @@
-# lig-local-images v1.1.6
+# lig-local-images v1.1.7
 
 本地图片图床 Luker 后端插件 (任意目录只读图床 + user/images 嵌套管理)。
 

@@ -68,7 +68,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.1.6';
+const PLUGIN_VERSION = '1.1.7';
 /**
  * 能力清单。
  * 前端靠它决定"图库导入走服务端复制还是走下载+重传"、"清空缩略图缓存按钮走新端点还是退回旧行为"
@@ -735,10 +735,13 @@ export async function init(router) {
    * 第97次：从"1 个 worker 串行"改成**固定 4 路并行**。
    * 依据：单张缩略图约 1.8~2.5 秒，且 95% 的时间花在 jimp 解码那一段（纯 JS、单线程），
    * 所以多开 worker 才是唯一真正的提速手段（4 路理论 26 分钟 → 7~9 分钟）。
-   * 内存账：解一张 4096px 的图约 48MB 位图 + 源数据，4 路峰值 300~400MB；
-   * 用户机器 16G 内存，按 4 起步（若以后手机端吃紧，改这一个常量即可降回 2）。
+   * 内存账：解一张 4096px 的图约 48MB 位图 + 源数据，4 路峰值 300~400MB。
+   *
+   * 第98次：**降回 2 路**。用户手机（荣耀 Win RT，16G 内存）实测 4 路会把酒馆整个压崩溃 ——
+   * 卡住的不是主内存总量，而是安卓侧单个进程能吃到的内存上限。
+   * 两端共用这一份常量（手机仓库由本文件生成），所以电脑端也一起变成 2 路。
    */
-  const THUMB_WORKERS = 4;
+  const THUMB_WORKERS = 2;
   /** 池里的槽位：{ worker, busy, currentId } */
   const workerPool = [];
   let workerBroken = false;
