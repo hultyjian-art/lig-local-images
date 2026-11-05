@@ -68,7 +68,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.1.4';
+const PLUGIN_VERSION = '1.1.6';
 /**
  * 能力清单。
  * 前端靠它决定"图库导入走服务端复制还是走下载+重传"、"清空缩略图缓存按钮走新端点还是退回旧行为"
@@ -458,12 +458,27 @@ export async function init(router) {
    * 按用户隔离、不进 git、酒馆升级不会被清；拿不到（例如未登录）就退回纯内存，功能不减。
    */
   const THUMB_DISK_DIR = 'lig-local-images.thumbs';
-  /** 磁盘缓存条目上限（张）。超了按 mtime 逐出最老的 —— 缩略图是可再生物，删掉最多慢一次，不丢用户的东西 */
-  const THUMB_DISK_MAX_FILES = 8000;
+  /**
+   * 磁盘缓存条目上限（张）。超了按 mtime 逐出最老的 —— 缩略图是可再生物，删掉最多慢一次，不丢用户的东西。
+   * 第96次：8000 → 10000（实测每张约 18KB，一万张也就 ~180MB）。
+   */
+  const THUMB_DISK_MAX_FILES = 10000;
+  /**
+   * 第96次：**30 天没用过就删**。
+   * 判据是文件 mtime —— 所以"用过"必须有痕迹：命中缓存时把 mtime 刷新一次（见 touchThumbHit），
+   * 否则 mtime 永远等于"生成时间"，这条 TTL 就变成了"生成满 30 天一律删"，会把长期在用的目录也扫掉。
+   */
+  const THUMB_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+  /** 命中后多久才刷一次 mtime：同日反复浏览只写一次盘 */
+  const THUMB_TOUCH_EVERY_MS = 24 * 60 * 60 * 1000;
+  /** TTL 扫描的最小间隔：不能每次请求都 dir 一万个文件 */
+  const THUMB_TTL_SWEEP_EVERY_MS = 6 * 60 * 60 * 1000;
   /** 每写 N 张查一次是否超限（每次请求都 readdir 不划算） */
   const THUMB_DISK_PRUNE_EVERY = 200;
-  const thumbDiskStats = { hits: 0, writes: 0, failed: 0, pruned: 0, dir: null };
+  const thumbDiskStats = { hits: 0, writes: 0, failed: 0, pruned: 0, touched: 0, expired: 0, dir: null };
   let thumbDiskWriteCount = 0;
+  /** 上一次 TTL 扫描的时间戳（0 = 还没扫过） */
+  let lastTtlSweep = 0;
 
   /** 本用户的缩略图缓存目录（与 roots.json 同处用户数据根）；拿不到返回 null = 只走内存 */
   function thumbDiskDirOf(req) {
@@ -510,6 +525,46 @@ export async function init(router) {
       return fs.statSync(file).isFile() ? fs.readFileSync(file) : null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * 第96次：命中缓存时刷新 mtime —— 这是 TTL 能区分"没人用"和"天天用"的唯一依据。
+   * 节流到一天一次：同一天里反复浏览同一批图，不该每次都写盘。
+   */
+  function touchThumbHit(file) {
+    try {
+      const st = fs.statSync(file);
+      if (Date.now() - st.mtimeMs < THUMB_TOUCH_EVERY_MS) return;
+      const now = new Date();
+      fs.utimesSync(file, now, now);
+      thumbDiskStats.touched++;
+    } catch {
+      /* 刷不动只意味着 TTL 少一条依据，不影响本次显示 */
+    }
+  }
+
+  /** 第96次：最多每 6 小时扫一次 TTL（扫描本身要 dir 一万个文件，不能挂在每次请求上） */
+  function maybeTtlSweep(dir) {
+    const now = Date.now();
+    if (lastTtlSweep && now - lastTtlSweep < THUMB_TTL_SWEEP_EVERY_MS) return;
+    lastTtlSweep = now;
+    try {
+      const names = fs.readdirSync(dir).filter(n => n.endsWith('.webp') || n.endsWith('.jpg'));
+      let dropped = 0;
+      for (const n of names) {
+        const p = path.join(dir, n);
+        try {
+          const st = fs.statSync(p);
+          if (now - st.mtimeMs > THUMB_TTL_MS) { fs.rmSync(p, { force: true }); dropped++; }
+        } catch { /* 单条读不到就跳过 */ }
+      }
+      if (dropped) {
+        thumbDiskStats.expired += dropped;
+        console.info(`[lig-local-images] 缩略图 TTL 清理 ${dropped} 张（超过 ${Math.round(THUMB_TTL_MS / 86400000)} 天未使用）`);
+      }
+    } catch {
+      /* 目录不存在/读不了：下次再说 */
     }
   }
 
@@ -650,6 +705,8 @@ export async function init(router) {
     thumbDiskStats.writes = 0;
     thumbDiskStats.failed = 0;
     thumbDiskStats.pruned = 0;
+    thumbDiskStats.touched = 0;
+    thumbDiskStats.expired = 0;
   }
 
   /**
@@ -674,63 +731,114 @@ export async function init(router) {
   const WORKER_RETRY_MS = 30_000;
   /** worker 不可用期间，最多让主线程代解几张；超过就改回原图，绝不拿事件循环去换缩略图 */
   const MAIN_FALLBACK_MAX = 5;
-  let thumbWorker = null;
+  /**
+   * 第97次：从"1 个 worker 串行"改成**固定 4 路并行**。
+   * 依据：单张缩略图约 1.8~2.5 秒，且 95% 的时间花在 jimp 解码那一段（纯 JS、单线程），
+   * 所以多开 worker 才是唯一真正的提速手段（4 路理论 26 分钟 → 7~9 分钟）。
+   * 内存账：解一张 4096px 的图约 48MB 位图 + 源数据，4 路峰值 300~400MB；
+   * 用户机器 16G 内存，按 4 起步（若以后手机端吃紧，改这一个常量即可降回 2）。
+   */
+  const THUMB_WORKERS = 4;
+  /** 池里的槽位：{ worker, busy, currentId } */
+  const workerPool = [];
   let workerBroken = false;
   let workerBrokenAt = 0;
   /** 本轮 worker 缺席期间已经让主线程代解的张数（worker 一起来就清零） */
   let mainFallbackUsed = 0;
-  let workerBusy = false;
   let taskSeq = 0;
   const pendingTasks = new Map(); // id -> { resolve, reject }
-  const taskQueue = [];           // 待投递任务 { id, abs, width }
+  const taskQueue = [];           // 待投递任务 { id, abs, width, format }
+  /**
+   * 第97次：同一张图的"正在生成"合并表。
+   * 快速滚动/多标签页下同一张图会被请求多次，以前是各自排队各自解码（白烧 CPU）。
+   * key = 绝对路径|宽|格式，值 = 那次生成的 Promise。
+   */
+  const inflightThumbs = new Map();
   let fallbackQueue = 0;          // 主线程回退路径的排队数
 
-  function startThumbWorker() {
-    if (thumbWorker || workerBroken) return thumbWorker;
+  function liveWorkerCount() {
+    return workerPool.filter(s => s && s.worker).length;
+  }
+  function busyWorkerCount() {
+    return workerPool.filter(s => s && s.worker && s.busy).length;
+  }
+
+  /**
+   * 造一个新 worker。返回槽位对象（含失败），失败返回 null。
+   * 每个槽位的回调只处理**自己那个** currentId，出错只作废自己 —— 一个 worker 崩了，
+   * 另外三个继续跑（老写法是"一崩全崩、整只插件退回主线程同步解码"）。
+   */
+  function spawnWorker() {
+    const slot = { worker: null, busy: false, currentId: null };
     try {
-      thumbWorker = new Worker(new URL('./lib/thumb-worker.mjs', import.meta.url));
-      // 新 worker 起来了 ⇒ 主线程代解的额度重新给满（判据见 MAIN_FALLBACK_MAX）
+      const w = new Worker(new URL('./lib/thumb-worker.mjs', import.meta.url));
+      slot.worker = w;
+      // 有 worker 可用 ⇒ 主线程代解额度重新给满（判据见 MAIN_FALLBACK_MAX）
       mainFallbackUsed = 0;
-      thumbWorker.on('message', (msg) => {
+      w.on('message', (msg) => {
+        slot.busy = false;
+        slot.currentId = null;
         const task = pendingTasks.get(msg?.id);
-        workerBusy = false;
         if (task) {
           pendingTasks.delete(msg.id);
           if (msg.ok) {
             task.resolve(msg.buf ? { buf: Buffer.from(msg.buf), mime: msg.mime || 'image/jpeg' } : { reason: msg.reason || 'tooSmall' });
+          } else {
+            task.reject(new Error(msg.error || 'worker 解码失败'));
           }
-          else task.reject(new Error(msg.error || 'worker 解码失败'));
         }
         drainThumbQueue();
       });
-      thumbWorker.on('error', (e) => {
-        workerBroken = true;
-        workerBrokenAt = Date.now();
-        thumbWorker = null;
-        workerBusy = false;
-        console.warn('[lig-local-images] 缩略图 worker 异常，暂时改用主线程解码（有上限，且稍后重试起 worker）:', fmtErr(e));
-        for (const [, task] of pendingTasks) task.reject(e);
-        pendingTasks.clear();
-        drainThumbQueue();
+      w.on('error', (e) => {
+        dropSlot(slot, e);
+        console.warn('[lig-local-images] 缩略图 worker 异常（其它槽位继续跑）:', fmtErr(e));
       });
-      thumbWorker.on('exit', (code) => {
-        thumbWorker = null;
-        workerBusy = false;
-        // 非正常退出同样标记为"坏了"并进入重试冷却 —— 否则一个"起来就崩"的 worker
-        // 会被 drainThumbQueue 每次排队都重 spawn 一遍，把日志刷爆还可能拖住请求。
-        if (code !== 0) {
-          workerBroken = true;
-          workerBrokenAt = Date.now();
-          console.warn(`[lig-local-images] 缩略图 worker 异常退出(code=${code})，进入重试冷却`);
-        }
-        drainThumbQueue();
+      w.on('exit', (code) => {
+        dropSlot(slot);
+        if (code !== 0) console.warn(`[lig-local-images] 缩略图 worker 退出(code=${code})，稍后补位`);
       });
+      return slot;
     } catch (e) {
       workerBroken = true;
       workerBrokenAt = Date.now();
       console.warn('[lig-local-images] 缩略图 worker 不可用，改用主线程解码（有上限）:', fmtErr(e));
+      return null;
     }
-    return thumbWorker;
+  }
+
+  /** 作废一个槽位；它手上那张任务就地失败（请求方会回退原图），不影响别的槽位 */
+  function dropSlot(slot, err) {
+    if (!slot) return;
+    const id = slot.currentId;
+    slot.worker = null;
+    slot.busy = false;
+    slot.currentId = null;
+    if (id != null) {
+      const task = pendingTasks.get(id);
+      if (task) {
+        pendingTasks.delete(id);
+        task.reject(err instanceof Error ? err : new Error('worker 已退出'));
+      }
+    }
+    if (liveWorkerCount() === 0) {
+      workerBroken = true;
+      workerBrokenAt = Date.now();
+    }
+    drainThumbQueue();
+  }
+
+  /** 把池子补满 THUMB_WORKERS（崩掉的槽位下次 drain 自动补位） */
+  function ensurePool() {
+    // 清掉已经死掉的槽位，保持长度等于池容量
+    for (let i = workerPool.length - 1; i >= 0; i--) {
+      if (!workerPool[i] || !workerPool[i].worker) workerPool.splice(i, 1);
+    }
+    while (workerPool.length < THUMB_WORKERS) {
+      const slot = spawnWorker();
+      if (!slot) return false;
+      workerPool.push(slot);
+    }
+    return true;
   }
 
   function drainThumbQueue() {
@@ -740,12 +848,15 @@ export async function init(router) {
       console.info('[lig-local-images] 重试启动缩略图 worker');
     }
     if (workerBroken) return;
-    const worker = startThumbWorker();
-    if (!worker || workerBusy) return;
-    const task = taskQueue.shift();
-    if (!task) return;
-    workerBusy = true;
-    worker.postMessage(task);
+    if (!ensurePool()) return;
+    for (const slot of workerPool) {
+      if (!slot.worker || slot.busy) continue;
+      const task = taskQueue.shift();
+      if (!task) break;
+      slot.busy = true;
+      slot.currentId = task.id;
+      slot.worker.postMessage(task);
+    }
   }
 
   /**
@@ -777,6 +888,20 @@ export async function init(router) {
    * @returns {{ buf: Buffer, mime: string } | null} —— null 表示"应回退原图"（原图已够小 / 队列积压 / 解码失败）
    */
   async function generateThumb(abs, width, format) {
+    // 第97次：同一张图正在生成时直接等那次的结果，不重复解码
+    const key = `${abs}|${width}|${format}`;
+    const running = inflightThumbs.get(key);
+    if (running) return running;
+    const p = generateThumbUncached(abs, width, format);
+    inflightThumbs.set(key, p);
+    try {
+      return await p;
+    } finally {
+      inflightThumbs.delete(key);
+    }
+  }
+
+  async function generateThumbUncached(abs, width, format) {
     if (workerBroken) {
       try {
         return await decodeThumbOnMainThread(abs, width, format);
@@ -785,7 +910,7 @@ export async function init(router) {
         return { reason: 'decodeFailed' };
       }
     }
-    if (taskQueue.length + (workerBusy ? 1 : 0) >= THUMB_QUEUE_MAX) return { reason: 'queueFull' };
+    if (taskQueue.length + busyWorkerCount() >= THUMB_QUEUE_MAX) return { reason: 'queueFull' };
     return new Promise((resolve) => {
       const id = ++taskSeq;
       pendingTasks.set(id, {
@@ -880,6 +1005,8 @@ export async function init(router) {
       const found = findThumbOnDisk(diskDir, stamp);
       if (found) {
         thumbDiskStats.hits++;
+        touchThumbHit(found.file); // 第96次：刷 mtime，让"用过"有痕迹
+        maybeTtlSweep(diskDir);    // 第96次：顺带做（有 6 小时节流）
         const out = { buf: found.buf, mime: found.mime };
         rememberRam(out);
         res.type(out.mime).set('Cache-Control', cacheHeader).set('Vary', 'Accept').send(out.buf);
