@@ -68,7 +68,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.1.7';
+const PLUGIN_VERSION = '1.1.8';
 /**
  * 能力清单。
  * 前端靠它决定"图库导入走服务端复制还是走下载+重传"、"清空缩略图缓存按钮走新端点还是退回旧行为"
@@ -122,7 +122,7 @@ function realpathOrNull(p) {
   }
 }
 
-function scanDir(abs, urlFor, thumbFor, idBase) {
+function scanDir(abs, urlFor, thumbFor, idBase, light = false) {
   const dirs = [];
   const images = [];
   const entries = fs.readdirSync(abs, { withFileTypes: true });
@@ -130,6 +130,20 @@ function scanDir(abs, urlFor, thumbFor, idBase) {
   let skipped = 0;
   for (const ent of entries) {
     if (ent.name.startsWith('.')) continue;
+    // 第101次「报菜名」极简模式：只按文件名分图片/目录，不 statSync（原模式一张图两次，几百张就几百次
+    // 系统调用，连续扫十几个大目录能把 Node 主线程占死）。索引只要「名字 + 路径 + 身份哈希」，这三样
+    // 都不用读文件：size/mtime 记 0，缩略图地址极简模式不生成。代价：名字带 .jpg 的目录会被当图片，
+    // 或无扩展名的图片会被当目录 —— 图库里几乎不会发生，且前端不会因此崩溃，只是多一次无效 /tree。
+    if (light) {
+      if (isImage(ent.name)) {
+        const idPath = idBase ? path.join(idBase, ent.name) : path.join(abs, ent.name);
+        images.push({ name: ent.name, size: 0, mtime: 0, idKey: fileIdKey(idPath), url: urlFor(ent.name) });
+      } else {
+        dirs.push(ent.name);
+      }
+      scanned++;
+      continue;
+    }
     // 第49次: Android /storage 的 FUSE 挂载不填 d_type, Dirent.isDirectory()/isFile()
     // 双双返回 false, 图片既不进 dirs 也不进 images → 列表恒空。类型判定一律以
     // statSync 为准 (FUSE 下可靠); Dirent 仅做快速路径。
@@ -412,13 +426,17 @@ export async function init(router) {
     const err = probeReadableDir(r.abs);
     if (err) return res.status(404).json({ error: err });
     // 第90次: 整次请求只做一次 realpath（不是每张图一次），把挂载别名收敛掉再算 idKey
+    // 第101次: light=1 开「报菜名」极简模式 —— 只回名字 + 身份哈希，不 statSync、不生成缩略图地址。
+    //          专供前端建持久索引；不传则保持原样（浏览图库要缩略图，不能砍）。
+    const light = String(req.query?.light ?? '') === '1';
     const { dirs, images, meta } = scanDir(
       r.abs,
       name => serveUrl(rootRef.id, dirRel, name),
       (name, meta) => serveThumbUrl(rootRef.id, dirRel, name, 320, meta),
       realpathOrNull(r.abs),
+      light,
     );
-    res.json({ dirs, images, meta });
+    res.json({ dirs, images, meta: { ...meta, light } });
   }));
 
   router.get('/file', wrap(async (req, res) => {
