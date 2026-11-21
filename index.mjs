@@ -58,6 +58,7 @@ import { Worker } from 'node:worker_threads';
 import { cleanRel, isImage, probeReadableDir, requireBelowImagesRoot, resolveUnder } from './lib/guard.mjs';
 import { decodeThumb, loadJimp } from './lib/thumb-core.mjs';
 import { loadRoots, newRootId, saveRoots } from './lib/store.mjs';
+import * as serverIndex from './lib/server-index.mjs';
 
 export const info = {
   id: 'lig-local-images',
@@ -68,7 +69,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.1.9';
+const PLUGIN_VERSION = '1.2.0';
 /**
  * 能力清单。
  * 前端靠它决定"图库导入走服务端复制还是走下载+重传"、"清空缩略图缓存按钮走新端点还是退回旧行为"
@@ -410,6 +411,62 @@ export async function init(router) {
    * 若 user/ 能列出 characters/chats/images 等，说明进程对数据区有读权限，
    * 那 images 的"空"就是它自身的问题；若连 user/ 也读不出，则是整体权限或路径错。
    */
+  // ============ 第103次: 后端低内存持久化索引（彻底版） ============
+  router.get('/index/status', wrap(async (req, res) => {
+    setDiagHeader(res, { ep: 'index-status' });
+    const st = serverIndex.loadIndex(req.user.directories);
+    res.json({ ok: true, bootAt: BOOT_AT, ...serverIndex.statusOf(st) });
+  }));
+
+  router.get('/index/query', wrap(async (req, res) => {
+    setDiagHeader(res, { ep: 'index-query' });
+    const source = String(req.query?.source ?? '');
+    const st = serverIndex.loadIndex(req.user.directories);
+    res.json({ ok: true, dirs: serverIndex.queryIndex(st, source || null), updatedAt: st.updatedAt });
+  }));
+
+  // 前端驱动一步：后端流式读一批（低内存），返回值决定下一拍多久后再来
+  router.get('/index/tick', wrap(async (req, res) => {
+    setDiagHeader(res, { ep: 'index-tick' });
+    const dirs = req.user.directories;
+    const st = serverIndex.loadIndex(dirs);
+    const r = serverIndex.tick(st, dirs, (rootId, dirRel, record, batch) => scanOneBatch(rootId, dirRel, record, batch, dirs));
+    if (r.action === 'deferred') blog('deferred', '暂缓 ' + r.label + ' (' + r.reason + ')');
+    if (r.action === 'brake') blog('brake', '保护线刹车 rss=' + r.rss);
+    res.json({ ok: true, ...r });
+  }));
+
+  router.post('/index/dirty', wrap(async (req, res) => {
+    setDiagHeader(res, { ep: 'index-dirty' });
+    const dirs = req.user.directories;
+    const st = serverIndex.loadIndex(dirs);
+    serverIndex.markDirty(st, String(req.body?.rootId ?? ''), String(req.body?.dirRel ?? ''));
+    serverIndex.saveIndex(dirs, st);
+    blog('dirty', '标脏 ' + String(req.body?.rootId ?? '') + '::' + String(req.body?.dirRel ?? ''));
+    res.json({ ok: true });
+  }));
+
+  router.post('/index/retry', wrap(async (req, res) => {
+    setDiagHeader(res, { ep: 'index-retry' });
+    const dirs = req.user.directories;
+    const st = serverIndex.loadIndex(dirs);
+    serverIndex.retryDeferred(st, String(req.body?.key ?? ''));
+    serverIndex.saveIndex(dirs, st);
+    blog('retry', '重试 ' + String(req.body?.key ?? ''));
+    res.json({ ok: true });
+  }));
+
+  router.post('/index/start', wrap(async (req, res) => {
+    setDiagHeader(res, { ep: 'index-start' });
+    const dirs = req.user.directories;
+    const st = serverIndex.loadIndex(dirs);
+    const roots = loadRoots(dirs);
+    for (const r of roots) serverIndex.startScan(st, r.id);
+    serverIndex.startScan(st, LIBRARY_ROOT_ID);
+    serverIndex.saveIndex(dirs, st);
+    blog('start', '启动后端索引，根数=' + (roots.length + 1));
+    res.json({ ok: true, pending: st.queue.length });
+  }));
   router.get('/diaglog', wrap(async (req, res) => {
     setDiagHeader(res, { ep: 'diaglog' });
     res.json({ ok: true, version: PLUGIN_VERSION, bootAt: BOOT_AT, uptime: Date.now() - BOOT_AT, treeTotal, logs: backendLog.slice() });
@@ -1372,6 +1429,60 @@ function countImages(absDir) {
  * - library 根 → Luker 静态路由 /user/images/<rel>（天然支持嵌套与中文）
  * - 外部根 → 插件 /file 端点
  */
+// ===== 第103次: 后端低内存分批扫描（彻底版核心，供 /index/tick 调用） =====
+/**
+ * 扫描一个目录的一批文件。低内存要点：
+ *  - 不 readdirSync 整个目录进数组；用 opendirSync 流式读，游标存在 record.cursor 里，下次接着读。
+ *  - 每批只处理 BATCH 个，处理完就返回让前端存盘，内存里只留这一小撮。
+ *  - record 里存已收集的 images/subdirs 和游标；done=true 时整目录完成。
+ */
+function scanOneBatch(rootId, dirRel, record, batch, directories) {
+  const rootRef = resolveRootBase({ user: { directories } }, rootId);
+  if (!rootRef) throw new Error('根不存在: ' + rootId);
+  const r = resolveUnder(rootRef.baseAbs, dirRel);
+  if (!r.ok) throw new Error(r.error);
+  const err = probeReadableDir(r.abs);
+  if (err) throw new Error(err);
+  const rec = record && record.images ? record : { images: [], subdirs: [], source: (rootId === LIBRARY_ROOT_ID ? 'imported' : 'gallery'), rootId, dirRel, label: dirRel.split('/').pop() || '(根)', cursorDone: false, cap: false };
+  if (rec.cursorDone) return { done: true, record: rec };
+  // opendir 流式：跳过已处理的前 rec.seen 个条目
+  const dir = fs.opendirSync(r.abs);
+  try {
+    let skip = rec.seen || 0;
+    let taken = 0;
+    let ent;
+    while (taken < batch && (ent = dir.readSync()) !== null) {
+      if (skip > 0) { skip--; continue; }
+      rec.seen = (rec.seen || 0) + 1;
+      if (ent.name.startsWith('.')) continue;
+      if (isImage(ent.name)) {
+        if (rec.images.length >= MAX_FILES_PER_DIR_LOCAL) { rec.cap = true; continue; }
+        let isFile = ent.isFile();
+        if (!isFile && !ent.isDirectory()) {
+          try { isFile = fs.statSync(path.join(r.abs, ent.name)).isFile(); } catch { continue; }
+        }
+        if (!isFile) continue;
+        const relName = dirRel ? dirRel + '/' + ent.name : ent.name;
+        const idPath = path.join(rootRef.baseAbs, relName);
+        rec.images.push({
+          name: ent.name,
+          url: serveUrl(rootId, dirRel, ent.name),
+          idKey: crypto.createHash('sha1').update(idPath.replace(/\\/g, '/')).digest('hex').slice(0, 16),
+        });
+      } else if (ent.isDirectory() || (!ent.isFile() && safeIsDir(path.join(r.abs, ent.name)))) {
+        rec.subdirs.push(dirRel ? dirRel + '/' + ent.name : ent.name);
+      }
+      taken++;
+    }
+    if (ent === null) rec.cursorDone = true;    // 读到头 = 本目录完成
+  } finally {
+    try { dir.closeSync(); } catch { /* ignore */ }
+  }
+  return { done: !!rec.cursorDone, record: rec };
+}
+const MAX_FILES_PER_DIR_LOCAL = 4000;
+function safeIsDir(p) { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
+
 function serveUrl(rootId, dirRel, name) {
   const rel = dirRel ? `${dirRel}/${name}` : name;
   if (rootId === LIBRARY_ROOT_ID) {
