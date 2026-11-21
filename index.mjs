@@ -68,13 +68,42 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.1.8';
+const PLUGIN_VERSION = '1.1.9';
 /**
  * 能力清单。
  * 前端靠它决定"图库导入走服务端复制还是走下载+重传"、"清空缩略图缓存按钮走新端点还是退回旧行为"
  * —— 探测不到就当没有，老版插件配新前端仍然是完整可用的旧行为（新前端配老插件不能坏）。
  */
 const PLUGIN_FEATURES = ['copy', 'thumb-cache', 'tree-id'];
+
+// ===== 第102次: 后端健康快照（随响应头回传，进程被杀后仍留在前端黑匣子里） =====
+const BOOT_AT = Date.now();
+const BACKEND_LOG_MAX = 200;
+const backendLog = [];
+let treeTotal = 0;
+function blog(kind, text) {
+  try {
+    backendLog.push({ at: Date.now(), kind: String(kind).slice(0, 20), text: String(text).slice(0, 240) });
+    if (backendLog.length > BACKEND_LOG_MAX) backendLog.splice(0, backendLog.length - BACKEND_LOG_MAX);
+  } catch { /* 诊断绝不干扰业务 */ }
+}
+function backendSnapshot(extra) {
+  try {
+    const m = process.memoryUsage ? process.memoryUsage() : null;
+    const o = {
+      v: PLUGIN_VERSION,
+      up: Date.now() - BOOT_AT,
+      tree: treeTotal,
+      rss: m ? Math.round(m.rss / 1048576) : -1,
+      heap: m ? Math.round(m.heapUsed / 1048576) : -1,
+      ...(extra || {}),
+    };
+    return JSON.stringify(o);
+  } catch { return ''; }
+}
+function setDiagHeader(res, extra) {
+  try { res.setHeader('X-Lig-Diag', backendSnapshot(extra)); } catch { /* ignore */ }
+}
 
 /**
  * 缩略图 URL 的版本号（第62次新增，跟随 WebP 协商一起发布）。
@@ -104,8 +133,10 @@ function wrap(handler) {
     try {
       await handler(req, res);
     } catch (e) {
+      blog('error', '请求失败 ' + req.path + ' :: ' + ((e && e.message) || String(e)).slice(0, 180));
       console.error('[lig-local-images] 请求失败:', req.path, e);
       if (!res.headersSent) {
+        setDiagHeader(res, { ep: 'error', path: req.path });
         res.status(500).json({ error: e?.message ?? String(e) });
       }
     }
@@ -328,6 +359,7 @@ export async function init(router) {
   router.get('/ping', wrap(async (req, res) => {
     // ?reset=1 清零缩略图统计 —— 方便"清缓存 → 浏览图库 → 再看计数"的自查流程
     if (/^(1|true|yes|on)$/i.test(String(req.query?.reset ?? ''))) resetThumbStats();
+    setDiagHeader(res, { ep: 'ping' });
     res.json({ ok: true, name: info.name, version: PLUGIN_VERSION, api: API_VERSION, features: PLUGIN_FEATURES, thumb: thumbStatsSnapshot() });
   }));
 
@@ -378,6 +410,11 @@ export async function init(router) {
    * 若 user/ 能列出 characters/chats/images 等，说明进程对数据区有读权限，
    * 那 images 的"空"就是它自身的问题；若连 user/ 也读不出，则是整体权限或路径错。
    */
+  router.get('/diaglog', wrap(async (req, res) => {
+    setDiagHeader(res, { ep: 'diaglog' });
+    res.json({ ok: true, version: PLUGIN_VERSION, bootAt: BOOT_AT, uptime: Date.now() - BOOT_AT, treeTotal, logs: backendLog.slice() });
+  }));
+
   router.get('/diag', wrap(async (req, res) => {
     const images = userImages(req);
     res.json({
@@ -418,7 +455,11 @@ export async function init(router) {
 
   // ============ 只读图床：浏览与供图 ============
   router.get('/tree', wrap(async (req, res) => {
-    const rootRef = resolveRootBase(req, String(req.query?.root ?? ''));
+    const __t0 = Date.now();
+    const __root = String(req.query?.root ?? '');
+    const __dir = cleanRel(String(req.query?.dir ?? ''));
+    blog('tree.begin', __root + ' | ' + __dir);
+    const rootRef = resolveRootBase(req, __root);
     if (!rootRef) return res.status(404).json({ error: '根不存在' });
     const dirRel = cleanRel(String(req.query?.dir ?? ''));
     const r = resolveUnder(rootRef.baseAbs, dirRel);
@@ -436,6 +477,10 @@ export async function init(router) {
       realpathOrNull(r.abs),
       light,
     );
+    const __ms = Date.now() - __t0;
+    treeTotal += 1;
+    blog('tree.done', __ms + 'ms imgs=' + (images ? images.length : 0) + ' dirs=' + (dirs ? dirs.length : 0) + ' | ' + __root + '/' + __dir + (light ? ' [light]' : ''));
+    setDiagHeader(res, { last: __ms, root: __root.slice(0, 16), dir: __dir.slice(0, 60) });
     res.json({ dirs, images, meta: { ...meta, light } });
   }));
 
