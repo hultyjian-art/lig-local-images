@@ -48,6 +48,12 @@
  * - v1.0.6 新增只读 /diag：把 user/images 与各注册根的路径归属、exists/stat/access/readdir
  *   各层结果、逐条 stat 样本全列出来，用于现场判定"目录有内容却显示为空"到底是
  *   路径错、权限被静默过滤、还是真的空。无副作用，不写盘。
+ * - v1.2.2（第105次）修 1.2.1 "后端索引反而更费内存"的两个结构性开销：
+ *   ① 每次 tick 都整份读盘 parse + 整份写盘（见 lib/server-index.mjs 第105次说明）→ 改为进程内
+ *      缓存 + 落盘节流（普通批次最多 1 秒写一次，目录完成/刹车/出错/手动操作强制写）；
+ *   ② 断点续跑每批 opendirSync + readSync 跳过前 rec.seen 条（4000 条的目录要开 100 次目录、
+ *      累计跳 20 万条）→ 改为目录条目只在第一拍读一次并缓存（最多 4 个目录 / 2 分钟），
+ *      之后按下标切片，跳过的代价降为 0。行为与对外接口不变（/index/* 协议不动）。
  */
 
 import crypto from 'node:crypto';
@@ -69,7 +75,7 @@ export const info = {
 const API_VERSION = 1;
 const LIBRARY_ROOT_ID = 'library';
 /** 插件版本（唯一来源：/ping 与 /diag 都读它，避免两处不一致） */
-const PLUGIN_VERSION = '1.2.1';
+const PLUGIN_VERSION = '1.2.2';
 /**
  * 能力清单。
  * 前端靠它决定"图库导入走服务端复制还是走下载+重传"、"清空缩略图缓存按钮走新端点还是退回旧行为"
@@ -441,7 +447,7 @@ export async function init(router) {
     const dirs = req.user.directories;
     const st = serverIndex.loadIndex(dirs);
     serverIndex.markDirty(st, String(req.body?.rootId ?? ''), String(req.body?.dirRel ?? ''));
-    serverIndex.saveIndex(dirs, st);
+    serverIndex.saveIndex(dirs, st, { force: true });
     blog('dirty', '标脏 ' + String(req.body?.rootId ?? '') + '::' + String(req.body?.dirRel ?? ''));
     res.json({ ok: true });
   }));
@@ -451,7 +457,7 @@ export async function init(router) {
     const dirs = req.user.directories;
     const st = serverIndex.loadIndex(dirs);
     serverIndex.retryDeferred(st, String(req.body?.key ?? ''));
-    serverIndex.saveIndex(dirs, st);
+    serverIndex.saveIndex(dirs, st, { force: true });
     blog('retry', '重试 ' + String(req.body?.key ?? ''));
     res.json({ ok: true });
   }));
@@ -463,7 +469,7 @@ export async function init(router) {
     const roots = loadRoots(dirs);
     for (const r of roots) serverIndex.startScan(st, r.id);
     serverIndex.startScan(st, LIBRARY_ROOT_ID);
-    serverIndex.saveIndex(dirs, st);
+    serverIndex.saveIndex(dirs, st, { force: true });
     blog('start', '启动后端索引，根数=' + (roots.length + 1));
     res.json({ ok: true, pending: st.queue.length });
   }));
@@ -1432,10 +1438,38 @@ function countImages(absDir) {
 // ===== 第103次: 后端低内存分批扫描（彻底版核心，供 /index/tick 调用） =====
 /**
  * 扫描一个目录的一批文件。低内存要点：
- *  - 不 readdirSync 整个目录进数组；用 opendirSync 流式读，游标存在 record.cursor 里，下次接着读。
- *  - 每批只处理 BATCH 个，处理完就返回让前端存盘，内存里只留这一小撮。
- *  - record 里存已收集的 images/subdirs 和游标；done=true 时整目录完成。
+ *  - 目录条目只在第一拍读一次（缓存在进程里），之后每批按下标切片，不在内存里攒整目录。
+ *  - 每批只处理 batch 个，处理完就返回让前端存盘，内存里只留这一小撮。
+ *  - record 里存已收集的 images/subdirs 和游标（seen）；done=true 时整目录完成。
+ *
+ * 第105次(v1.2.2) 改掉 1.2.1 的 O(N²) 重开：1.2.1 每批都 opendirSync 再 readSync 跳过前
+ * rec.seen 条 —— 一个 4000 条的目录要开 100 次目录、累计跳过约 20 万条，是"改到后端反而更费
+ * 内存/更慢"的直接来源之一。缓存上限 4 个目录 / 2 分钟 / 单目录 2 万条，目录完成即释放。
  */
+const DIR_CACHE_MAX = 4;
+const DIR_CACHE_TTL_MS = 120_000;
+const DIR_CACHE_MAX_ENTRIES = 20_000;
+const dirEntryCache = new Map();   // abs -> { ents: Dirent[], at: number }
+
+/** 第105次: 目录条目（带类型）。fresh=true 强制重读；返回的数组由缓存持有，调用方只读不改 */
+function dirEntriesOf(abs, fresh) {
+  if (!fresh) {
+    const hit = dirEntryCache.get(abs);
+    if (hit && Date.now() - hit.at < DIR_CACHE_TTL_MS) {
+      dirEntryCache.delete(abs);
+      dirEntryCache.set(abs, hit);   // LRU：刚用过的放末尾
+      return hit.ents;
+    }
+  }
+  const ents = fs.readdirSync(abs, { withFileTypes: true });
+  dirEntryCache.delete(abs);
+  if (ents.length <= DIR_CACHE_MAX_ENTRIES) {
+    dirEntryCache.set(abs, { ents, at: Date.now() });
+    while (dirEntryCache.size > DIR_CACHE_MAX) dirEntryCache.delete(dirEntryCache.keys().next().value);
+  }
+  return ents;
+}
+
 function scanOneBatch(rootId, dirRel, record, batch, directories) {
   const rootRef = resolveRootBase({ user: { directories } }, rootId);
   if (!rootRef) throw new Error('根不存在: ' + rootId);
@@ -1445,39 +1479,37 @@ function scanOneBatch(rootId, dirRel, record, batch, directories) {
   if (err) throw new Error(err);
   const rec = record && record.images ? record : { images: [], subdirs: [], source: (rootId === LIBRARY_ROOT_ID ? 'imported' : 'gallery'), rootId, dirRel, label: dirRel.split('/').pop() || '(根)', cursorDone: false, cap: false };
   if (rec.cursorDone) return { done: true, record: rec };
-  // opendir 流式：跳过已处理的前 rec.seen 个条目
-  const dir = fs.opendirSync(r.abs);
-  try {
-    let skip = rec.seen || 0;
-    let taken = 0;
-    let ent;
-    while (taken < batch && (ent = dir.readSync()) !== null) {
-      if (skip > 0) { skip--; continue; }
-      rec.seen = (rec.seen || 0) + 1;
-      if (ent.name.startsWith('.')) continue;
-      if (isImage(ent.name)) {
-        if (rec.images.length >= MAX_FILES_PER_DIR_LOCAL) { rec.cap = true; continue; }
-        let isFile = ent.isFile();
-        if (!isFile && !ent.isDirectory()) {
-          try { isFile = fs.statSync(path.join(r.abs, ent.name)).isFile(); } catch { continue; }
-        }
-        if (!isFile) continue;
-        const relName = dirRel ? dirRel + '/' + ent.name : ent.name;
-        const idPath = path.join(rootRef.baseAbs, relName);
-        rec.images.push({
-          name: ent.name,
-          url: serveUrl(rootId, dirRel, ent.name),
-          idKey: crypto.createHash('sha1').update(idPath.replace(/\\/g, '/')).digest('hex').slice(0, 16),
-        });
-      } else if (ent.isDirectory() || (!ent.isFile() && safeIsDir(path.join(r.abs, ent.name)))) {
-        rec.subdirs.push(dirRel ? dirRel + '/' + ent.name : ent.name);
+  // 第105次: 条目只在第一拍读一次并缓存，之后按下标切片 —— 不再每批 opendirSync + readSync 跳过前 rec.seen 条
+  const fresh = !(rec.seen > 0);
+  const ents = dirEntriesOf(r.abs, fresh);
+  let i = rec.seen || 0;
+  let taken = 0;
+  while (i < ents.length && taken < batch) {
+    const ent = ents[i];
+    i++;
+    rec.seen = i;                       // 处理到第几条（含被忽略的隐藏条目），下次从这里接着来
+    if (ent.name.startsWith('.')) continue;
+    if (isImage(ent.name)) {
+      if (rec.images.length >= MAX_FILES_PER_DIR_LOCAL) { rec.cap = true; continue; }
+      let isFile = ent.isFile();
+      if (!isFile && !ent.isDirectory()) {
+        try { isFile = fs.statSync(path.join(r.abs, ent.name)).isFile(); } catch { continue; }
       }
-      taken++;
+      if (!isFile) continue;
+      const relName = dirRel ? dirRel + '/' + ent.name : ent.name;
+      const idPath = path.join(rootRef.baseAbs, relName);
+      rec.images.push({
+        name: ent.name,
+        url: serveUrl(rootId, dirRel, ent.name),
+        idKey: crypto.createHash('sha1').update(idPath.replace(/\\/g, '/')).digest('hex').slice(0, 16),
+      });
+    } else if (ent.isDirectory() || (!ent.isFile() && safeIsDir(path.join(r.abs, ent.name)))) {
+      rec.subdirs.push(dirRel ? dirRel + '/' + ent.name : ent.name);
     }
-    if (ent === null) rec.cursorDone = true;    // 读到头 = 本目录完成
-  } finally {
-    try { dir.closeSync(); } catch { /* ignore */ }
+    taken++;
   }
+  if (i >= ents.length) rec.cursorDone = true;    // 读到头 = 本目录完成
+  if (rec.cursorDone) dirEntryCache.delete(r.abs);   // 完成即释放这批 Dirent
   return { done: !!rec.cursorDone, record: rec };
 }
 const MAX_FILES_PER_DIR_LOCAL = 4000;
